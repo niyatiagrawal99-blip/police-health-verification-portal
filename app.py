@@ -16,6 +16,8 @@ from contextlib import contextmanager
 import pandas as pd
 import io
 
+POPPLER_PATH = "/usr/bin"
+
 # ── Tesseract (optional – OCR) ────────────────────────────────────
 try:
     import pytesseract
