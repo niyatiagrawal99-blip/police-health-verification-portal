@@ -15,12 +15,6 @@ from email.message import EmailMessage
 from contextlib import contextmanager
 import pandas as pd
 import io
-import os
-
-if os.name == "nt":
-    POPPLER_PATH = r"C:\poppler\Library\bin"
-else:
-    POPPLER_PATH = "/usr/bin"
 
 # ── Tesseract (optional – OCR) ────────────────────────────────────
 try:
@@ -30,7 +24,12 @@ try:
 except ImportError:
     TESSERACT_AVAILABLE = False
 
-POPPLER_PATH = r"C:\poppler\Library\bin"
+# ── PyMuPDF (fitz) for PDF processing ─────────────────────────────
+try:
+    import fitz
+    FITZ_AVAILABLE = True
+except ImportError:
+    FITZ_AVAILABLE = False
 
 # ── Password hashing ──────────────────────────────────────────────
 def hash_pw(password):
@@ -1229,22 +1228,27 @@ def extract_text_ocr(uploaded):
         file_type  = uploaded.type.lower()
         is_pdf     = "pdf" in file_type or uploaded.name.lower().endswith(".pdf")
         if is_pdf:
+            if not FITZ_AVAILABLE:
+                return "", "PyMuPDF (fitz) is not installed.\nRun: pip install PyMuPDF"
             try:
-                from pdf2image import convert_from_bytes
-            except ImportError:
-                return "", "pdf2image is not installed.\nRun: pip install pdf2image"
-            try:
-                pages = convert_from_bytes(file_bytes, dpi=300, poppler_path=POPPLER_PATH)
+                pdf_document = fitz.open(stream=file_bytes, filetype="pdf")
             except Exception as e:
-                return "", f"pdf2image conversion failed:\n{str(e)}"
+                return "", f"Failed to open PDF with fitz:\n{str(e)}"
             all_text = []
-            for page_num, page_img in enumerate(pages, 1):
-                try:
-                    processed  = preprocess_image(page_img)
-                    page_text  = pytesseract.image_to_string(processed, config="--oem 3 --psm 6")
-                    all_text.append(page_text)
-                except Exception as e:
-                    all_text.append(f"[Page {page_num} OCR error: {e}]")
+            try:
+                for page_num in range(len(pdf_document)):
+                    try:
+                        page = pdf_document[page_num]
+                        pix = page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
+                        img_data = pix.tobytes("ppm")
+                        page_img = Image.open(io.BytesIO(img_data))
+                        processed = preprocess_image(page_img)
+                        page_text = pytesseract.image_to_string(processed, config="--oem 3 --psm 6")
+                        all_text.append(page_text)
+                    except Exception as e:
+                        all_text.append(f"[Page {page_num + 1} OCR error: {e}]")
+            finally:
+                pdf_document.close()
             combined = "\n".join(all_text).strip()
             if not combined:
                 return "", "OCR ran but extracted no text from the PDF."
@@ -2504,13 +2508,13 @@ def page_report():
     card_open("How AI Report Analysis Works")
     st.markdown("""<div style="font-size:.9rem;color:#2d3f6b !important;line-height:1.9">
       <b style="color:#d9880c !important;">Step 1:</b> Upload your lab report (PDF, JPG or PNG) — up to 50 MB.<br>
-      <b style="color:#d9880c !important;">Step 2:</b> PDF is converted to images via pdf2image + Poppler, then OCR reads all text.<br>
+      <b style="color:#d9880c !important;">Step 2:</b> PDF is converted to images via PyMuPDF (fitz), then OCR reads all text.<br>
       <b style="color:#d9880c !important;">Step 3:</b> AI extracts <em>every</em> detectable field into a clean grouped table.<br>
       <b style="color:#d9880c !important;">Step 4:</b> Review results and save directly to your health profile.
       <br><br>
       <span style="color:#5a6f99 !important;font-size:.82rem">
         ℹ️ Tesseract path: <code>C:\\Program Files\\Tesseract-OCR\\tesseract.exe</code> &nbsp;|&nbsp;
-        Poppler path: <code>C:\\poppler\\Library\\bin</code>
+        PyMuPDF library: <code>fitz</code>
       </span>
     </div>""", unsafe_allow_html=True)
     card_close()
