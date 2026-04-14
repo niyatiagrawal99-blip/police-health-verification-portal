@@ -5,4 +5,4 @@ pillow
 pytesseract
 openpyxl
 matplotlib
-pdf2image
+PyMuPDF
