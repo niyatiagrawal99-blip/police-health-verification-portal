@@ -1240,9 +1240,13 @@ def extract_text_ocr(uploaded):
                     try:
                         page = pdf_document[page_num]
                         pix = page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
-                        img_data = pix.tobytes("ppm")
-                        page_img = Image.open(io.BytesIO(img_data))
-                        processed = preprocess_image(page_img)
+                        img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+                        # Convert to grayscale and apply thresholding for better OCR
+                        img = img.convert("L")  # Convert to grayscale
+                        # Apply thresholding to improve OCR accuracy
+                        threshold = 128
+                        img = img.point(lambda p: p > threshold and 255)
+                        processed = preprocess_image(img)
                         page_text = pytesseract.image_to_string(processed, config="--oem 3 --psm 6")
                         all_text.append(page_text)
                     except Exception as e:
@@ -1252,6 +1256,8 @@ def extract_text_ocr(uploaded):
             combined = "\n".join(all_text).strip()
             if not combined:
                 return "", "OCR ran but extracted no text from the PDF."
+            # Debug output
+            st.text(combined[:500])
             return combined, None
         else:
             try:
