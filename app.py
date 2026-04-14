@@ -15,8 +15,12 @@ from email.message import EmailMessage
 from contextlib import contextmanager
 import pandas as pd
 import io
+import os
 
-POPPLER_PATH = "/usr/bin"
+if os.name == "nt":
+    POPPLER_PATH = r"C:\poppler\Library\bin"
+else:
+    POPPLER_PATH = "/usr/bin"
 
 # ── Tesseract (optional – OCR) ────────────────────────────────────
 try:
