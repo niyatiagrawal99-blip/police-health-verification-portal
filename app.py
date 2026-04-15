@@ -8,86 +8,22 @@
 
 import streamlit as st
 import json, os, datetime, re, hashlib, uuid, random, time
-import base64
 import sqlite3
 import smtplib
 from email.message import EmailMessage
 from contextlib import contextmanager
 import pandas as pd
 import io
-import sys
-import platform
-import shutil
-import logging
-
-# ── Configure logging ──────────────────────────────────────────────
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
 
 # ── Tesseract (optional – OCR) ────────────────────────────────────
-TESSERACT_AVAILABLE = False
-TESSERACT_ERROR = None
-pytesseract = None
-
-def init_tesseract():
-    """
-    Initialize Tesseract OCR safely for any OS.
-    Uses shutil.which("tesseract") as primary detection method.
-    Never crashes if Tesseract is missing.
-    """
-    global TESSERACT_AVAILABLE, TESSERACT_ERROR, pytesseract
-    
-    try:
-        import pytesseract as pyt
-        pytesseract = pyt
-        logger.info("[OCR] pytesseract imported successfully")
-        
-        # Primary method: Use shutil.which("tesseract")
-        tesseract_path = shutil.which("tesseract")
-        if tesseract_path:
-            pytesseract.pytesseract.tesseract_cmd = tesseract_path
-            logger.info(f"[OCR] Using tesseract at: {tesseract_path}")
-            
-            # Test if it actually works
-            try:
-                version = pytesseract.get_tesseract_version()
-                logger.info(f"[OCR] Tesseract version: {version}")
-                TESSERACT_AVAILABLE = True
-                logger.info("[OCR] ✅ Tesseract initialized successfully")
-                return True
-            except Exception as test_err:
-                TESSERACT_ERROR = f"Tesseract found but not working: {str(test_err)}"
-                logger.error(f"[OCR] ❌ {TESSERACT_ERROR}")
-                return False
-        else:
-            TESSERACT_ERROR = "Tesseract not found in system PATH"
-            logger.warning(f"[OCR] ⚠️ {TESSERACT_ERROR}")
-            return False
-    
-    except ImportError as import_err:
-        TESSERACT_ERROR = "pytesseract library not installed"
-        logger.warning(f"[OCR] ⚠️ {TESSERACT_ERROR}: {str(import_err)}")
-        return False
-    
-    except Exception as e:
-        TESSERACT_ERROR = f"Unexpected error initializing Tesseract: {str(e)}"
-        logger.error(f"[OCR] ❌ {TESSERACT_ERROR}")
-        return False
-
-# Initialize Tesseract on app startup
-init_tesseract()
-
-# ── PyMuPDF (fitz) for PDF processing ─────────────────────────────
-FITZ_AVAILABLE = False
-fitz = None
-
 try:
-    import fitz as fitz_lib
-    fitz = fitz_lib
-    FITZ_AVAILABLE = True
-    logger.info("[PDF] PyMuPDF (fitz) imported successfully")
+    import pytesseract
+    pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+    TESSERACT_AVAILABLE = True
 except ImportError:
-    logger.warning("[PDF] PyMuPDF (fitz) not installed")
+    TESSERACT_AVAILABLE = False
+
+POPPLER_PATH = r"C:\poppler\Library\bin"
 
 # ── Password hashing ──────────────────────────────────────────────
 def hash_pw(password):
@@ -1277,206 +1213,263 @@ def preprocess_image(img):
     return img
 
 def extract_text_ocr(uploaded):
-    """
-    Extract text from PDF or image using OCR.
-    Safe: Returns empty text with error message if OCR unavailable.
-    """
     if not TESSERACT_AVAILABLE:
-        error_msg = TESSERACT_ERROR or "Tesseract OCR is not available."
-        logger.warning(f"[OCR] OCR unavailable: {error_msg}")
-        return "", error_msg
-    
+        return "", "Tesseract is not installed or not found at the configured path."
     try:
         from PIL import Image
+        import io
         file_bytes = uploaded.getvalue()
-        file_type = uploaded.type.lower()
-        is_pdf = "pdf" in file_type or uploaded.name.lower().endswith(".pdf")
-        
-        # ── PDF Processing ──
+        file_type  = uploaded.type.lower()
+        is_pdf     = "pdf" in file_type or uploaded.name.lower().endswith(".pdf")
         if is_pdf:
-            if not FITZ_AVAILABLE:
-                logger.error("[OCR] PyMuPDF (fitz) not available for PDF processing")
-                return "", "PyMuPDF (fitz) is not installed. Cannot process PDF."
-            
             try:
-                pdf_document = fitz.open(stream=file_bytes, filetype="pdf")
+                from pdf2image import convert_from_bytes
+            except ImportError:
+                return "", "pdf2image is not installed.\nRun: pip install pdf2image"
+            try:
+                pages = convert_from_bytes(file_bytes, dpi=300, poppler_path=POPPLER_PATH)
             except Exception as e:
-                logger.error(f"[OCR] Failed to open PDF: {str(e)}")
-                return "", f"Failed to open PDF: {str(e)}"
-            
+                return "", f"pdf2image conversion failed:\n{str(e)}"
             all_text = []
-            page_count = len(pdf_document)
-            logger.info(f"[OCR] Processing PDF with {page_count} pages")
-            
-            try:
-                for page_num in range(page_count):
-                    try:
-                        page = pdf_document[page_num]
-                        pix = page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
-                        img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-                        img = img.convert("L")
-                        threshold = 128
-                        img = img.point(lambda p: p > threshold and 255)
-                        processed = preprocess_image(img)
-                        
-                        try:
-                            page_text = pytesseract.image_to_string(processed, config="--oem 3 --psm 6")
-                            all_text.append(page_text)
-                            logger.info(f"[OCR] Successfully extracted page {page_num + 1}")
-                        except Exception as ocr_err:
-                            logger.error(f"[OCR] Tesseract failed on page {page_num + 1}: {str(ocr_err)}")
-                            # Add error marker but continue processing
-                            all_text.append(f"[Page {page_num + 1} OCR failed]")
-                    
-                    except Exception as page_err:
-                        logger.warning(f"[OCR] Error processing page {page_num + 1}: {str(page_err)}")
-                        all_text.append(f"[Page {page_num + 1} error]")
-            
-            finally:
-                pdf_document.close()
-            
+            for page_num, page_img in enumerate(pages, 1):
+                try:
+                    processed  = preprocess_image(page_img)
+                    page_text  = pytesseract.image_to_string(processed, config="--oem 3 --psm 6")
+                    all_text.append(page_text)
+                except Exception as e:
+                    all_text.append(f"[Page {page_num} OCR error: {e}]")
             combined = "\n".join(all_text).strip()
-            if not combined or all("[" in line for line in combined.split("\n")):
-                logger.warning("[OCR] No text extracted from PDF")
-                return "", "No readable text extracted from PDF. Try a clearer image."
-            
-            logger.info(f"[OCR] PDF extraction successful: {len(combined)} chars")
+            if not combined:
+                return "", "OCR ran but extracted no text from the PDF."
             return combined, None
-        
-        # ── Image Processing ──
         else:
             try:
                 img = Image.open(io.BytesIO(file_bytes))
-                logger.info(f"[OCR] Opened image: {img.size}")
             except Exception as e:
-                logger.error(f"[OCR] Failed to open image: {str(e)}")
-                return "", f"Could not open image: {str(e)}"
-            
+                return "", f"Could not open image file: {str(e)}"
             try:
                 processed = preprocess_image(img)
                 text = pytesseract.image_to_string(processed, config="--oem 3 --psm 6")
-                logger.info(f"[OCR] Image OCR complete: {len(text)} chars")
             except Exception as e:
-                logger.error(f"[OCR] Tesseract failed on image: {str(e)}")
-                return "", f"OCR processing failed: {str(e)}"
-            
+                return "", f"Tesseract OCR failed on image: {str(e)}"
             if not text.strip():
-                logger.warning("[OCR] Image OCR returned no text")
-                return "", "No text could be extracted from the image."
-            
+                return "", "OCR extracted no text from the image."
             return text.strip(), None
-    
     except Exception as e:
-        logger.error(f"[OCR] Unexpected error in extract_text_ocr: {str(e)}")
-        return "", f"Unexpected error during OCR: {str(e)}"
+        return "", f"Unexpected OCR error: {str(e)}"
 
 def clean_ocr_text(raw: str) -> str:
-    """Clean OCR text by removing noise and normalizing formatting."""
-    if not raw:
-        return ""
-    
-    raw = raw.replace('\r', '\n')
-    lines = []
-    for line in raw.splitlines():
-        line = re.sub(r'\s+', ' ', line).strip()
-        if len(line) < 2:
-            continue
-        if re.match(r'^[\W_]+$', line):
-            continue
-        lines.append(line.lower())
-    
-    result = "\n".join(lines)
-    logger.debug(f"[OCR] Cleaned text: {len(result)} chars from {len(raw)}")
-    return result
-
-
-def extract_patient_details(text: str) -> dict:
-    details = {}
-
-    name_match = re.search(r'(?:patient name|name)\s*[:\-]\s*([a-z][a-z\s\.\-]{2,})', text, re.IGNORECASE)
-    if name_match:
-        details['patient_name'] = name_match.group(1).strip().title()
-
-    age_match = re.search(r'\b(?:age|years old|yrs|yrs\.)\b\s*[:\-]?\s*(\d{1,3})', text, re.IGNORECASE)
-    if age_match:
-        details['age'] = int(age_match.group(1))
-
-    gender_match = re.search(r'\b(?:gender|sex)\b\s*[:\-]?\s*(male|female|other|m|f)\b', text, re.IGNORECASE)
-    if gender_match:
-        gender_value = gender_match.group(1).lower()
-        if gender_value == 'm':
-            gender_value = 'male'
-        elif gender_value == 'f':
-            gender_value = 'female'
-        details['gender'] = gender_value.title()
-
-    date_match = re.search(
-        r'\b(?:report date|date of report|date)\b\s*[:\-]?\s*([0-3]?\d[\/\-\.\s][01]?\d[\/\-\.\s]\d{2,4}|[A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4})',
-        text,
-        re.IGNORECASE,
-    )
-    if date_match:
-        details['report_date'] = parse_report_date(date_match.group(1))
-
-    return details
-
-
-def extract_all_fields(text: str) -> dict:
-    """Dynamic extraction of ALL values from OCR text."""
-    result = {}
-    lines = [re.sub(r'\s+', ' ', line).strip() for line in text.splitlines() if line.strip()]
-
-    pattern1 = re.compile(r'([A-Za-z][A-Za-z \(\)%/\-]{2,})\s*[:\-]?\s*(\d+\.?\d*)')
-    pattern2 = re.compile(r'([A-Za-z][A-Za-z \(\)%/\-]{2,})\s+(\d+\.?\d*)\s*(?:mg/dl|g/dl|mmhg|%|bpm|kg|cm|mmol/l|µg/dl|ng/ml)?', re.IGNORECASE)
-
+    lines = raw.splitlines()
+    clean = []
     for line in lines:
-        # Pattern 1 and 2 matches
-        for match in pattern1.findall(line):
-            label = match[0].strip()
-            value = match[1]
-            if len(re.sub(r'[^A-Za-z]', '', label)) < 3:
-                continue
-            key = re.sub(r'[^a-z0-9]+', '_', label.lower()).strip('_')
-            if key in ('age', 'gender', 'patient_name', 'report_date'):
-                continue
-            try:
-                result[key] = float(value)
-            except ValueError:
-                continue
+        line = line.strip()
+        if len(line) < 2: continue
+        if re.match(r'^[\W_]+$', line): continue
+        clean.append(line)
+    return "\n".join(clean)
 
-        for match in pattern2.findall(line):
-            label = match[0].strip()
-            value = match[1]
-            if len(re.sub(r'[^A-Za-z]', '', label)) < 3:
-                continue
-            key = re.sub(r'[^a-z0-9]+', '_', label.lower()).strip('_')
-            if key in ('age', 'gender', 'patient_name', 'report_date'):
-                continue
-            try:
-                result[key] = float(value)
-            except ValueError:
-                continue
+# ╔══════════════════════════════════════════════════════════════════╗
+# ║  AI REPORT EXTRACTION ENGINE                                    ║
+# ╚══════════════════════════════════════════════════════════════════╝
+def extract_all_fields(text: str) -> dict:
+    result = {}
+    t = text
 
-        # Tabular line handling: text + numeric value on the same line
-        parts = re.split(r'\t|\s{2,}', line)
-        if len(parts) >= 2:
-            candidate_value = parts[-1].strip()
-            value_match = re.match(r'^(\d+\.?\d*)$', candidate_value)
-            if value_match:
-                label = ' '.join(parts[:-1]).strip()
-                if len(re.sub(r'[^A-Za-z]', '', label)) >= 3:
-                    key = re.sub(r'[^a-z0-9]+', '_', label.lower()).strip('_')
-                    if key not in ('age', 'gender', 'patient_name', 'report_date'):
-                        try:
-                            result[key] = float(value_match.group(1))
-                        except ValueError:
-                            pass
+    for pat in [
+        r'(?:patient(?:\s+name)?|name\s+of\s+patient|pt\.?\s+name)[:\s]+([A-Za-z][A-Za-z\s\.]{2,35})',
+        r'(?:Mr\.|Mrs\.|Ms\.|Dr\.)\s+([A-Za-z][A-Za-z\s\.]{2,30})',
+        r'(?:^|\n)Name\s*[:\-]\s*([A-Za-z][A-Za-z\s\.]{2,30})',
+    ]:
+        m = re.search(pat, t, re.I | re.MULTILINE)
+        if m: result["Patient Name"] = m.group(1).strip().title(); break
 
-    # Special handling for blood pressure values
-    bp_match = re.search(r'(?:bp|blood pressure)[^\d]*(\d{2,3})\s*/\s*(\d{2,3})', text, re.IGNORECASE)
-    if bp_match:
-        result['bp_systolic'] = float(bp_match.group(1))
-        result['bp_diastolic'] = float(bp_match.group(2))
+    m = re.search(r'(?:age|patient\s+age)[:\s]*(\d{1,3})\s*(?:years?|yrs?|y\.?o\.?)?', t, re.I)
+    if m: result["Age"] = m.group(1) + " yrs"
+
+    m = re.search(r'(?:gender|sex)[:\s]*(male|female|m|f)\b', t, re.I)
+    if m:
+        g = m.group(1).strip().lower()
+        result["Gender"] = "Male" if g in ("m", "male") else "Female"
+    elif re.search(r'\bmale\b', t, re.I):   result["Gender"] = "Male"
+    elif re.search(r'\bfemale\b', t, re.I): result["Gender"] = "Female"
+
+    for pat in [
+        r'(?:date|report\s+date|dated?)[:\s]*(\d{1,2}[\-/\.]\d{1,2}[\-/\.]\d{2,4})',
+        r'(\d{1,2}[\-/\.]\d{1,2}[\-/\.]\d{4})',
+        r'(\d{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{4})',
+    ]:
+        m = re.search(pat, t, re.I)
+        if m: result["Report Date"] = m.group(1).strip(); break
+
+    m = re.search(r'(?:hospital|clinic|lab(?:oratory)?|medical\s+centre)[:\s]*([\w\s\.,&]+?)(?:\n|$)', t, re.I)
+    if m: result["Hospital / Lab"] = m.group(1).strip()[:60]
+
+    m = re.search(r'(?:doctor|physician|consultant|referred\s+by|dr\.)[:\s]*([A-Za-z][A-Za-z\s\.]{2,30})', t, re.I)
+    if m: result["Doctor"] = m.group(1).strip().title()
+
+    for pat in [
+        r'(?:blood\s*pressure|b\.?p\.?)[:\s=]+(\d{2,3})\s*/\s*(\d{2,3})',
+        r'(\d{2,3})\s*/\s*(\d{2,3})\s*mm\s*hg',
+        r'systolic[:\s=]+(\d{2,3}).*?diastolic[:\s=]+(\d{2,3})',
+    ]:
+        m = re.search(pat, t, re.I | re.DOTALL)
+        if m:
+            sys_v, dia_v = int(m.group(1)), int(m.group(2))
+            result["BP Systolic (mmHg)"]  = str(sys_v)
+            result["BP Diastolic (mmHg)"] = str(dia_v)
+            break
+
+    for label, pat in [
+        ("Fasting Blood Sugar (mg/dL)", r'(?:fasting\s*(?:blood\s*)?(?:sugar|glucose)|fbs)[:\s=]+(\d{2,3}(?:\.\d)?)'),
+        ("Random Blood Sugar (mg/dL)",  r'(?:random\s*(?:blood\s*)?sugar|rbs)[:\s=]+(\d{2,3}(?:\.\d)?)'),
+        ("Blood Glucose (mg/dL)",       r'(?:blood\s*glucose|glucose)[:\s=]+(\d{2,3}(?:\.\d)?)'),
+        ("HbA1c (%)",                   r'hba1c[:\s=]+(\d{1,2}(?:\.\d)?)'),
+    ]:
+        m = re.search(pat, t, re.I)
+        if m: result[label] = m.group(1); break
+
+    for label, pat in [
+        ("Total Cholesterol (mg/dL)", r'(?:total\s*cholesterol|t\.?\s*chol(?:esterol)?)[:\s=]+(\d{2,3}(?:\.\d)?)'),
+        ("Cholesterol (mg/dL)",       r'cholesterol[:\s=]+(\d{2,3}(?:\.\d)?)'),
+    ]:
+        m = re.search(pat, t, re.I)
+        if m: result["Cholesterol (mg/dL)"] = m.group(1); break
+
+    for label, pat in [
+        ("LDL Cholesterol (mg/dL)",  r'ldl[:\s=]+(\d{2,3}(?:\.\d)?)'),
+        ("HDL Cholesterol (mg/dL)",  r'hdl[:\s=]+(\d{2,3}(?:\.\d)?)'),
+        ("Triglycerides (mg/dL)",    r'(?:triglycerides?|tgl)[:\s=]+(\d{2,3}(?:\.\d)?)'),
+        ("VLDL (mg/dL)",             r'vldl[:\s=]+(\d{2,3}(?:\.\d)?)'),
+    ]:
+        m = re.search(pat, t, re.I)
+        if m: result[label] = m.group(1)
+
+    for label, pat in [
+        ("Haemoglobin (g/dL)", r'(?:haemoglobin|hemoglobin|hb|hgb)[:\s=]+(\d{1,2}(?:\.\d{1,2})?)'),
+        ("WBC Count (×10³/µL)",r'(?:wbc|white\s*blood\s*cells?)[:\s=]+(\d+(?:\.\d+)?)'),
+        ("RBC Count (×10⁶/µL)",r'(?:rbc|red\s*blood\s*cells?)[:\s=]+(\d+(?:\.\d+)?)'),
+        ("Platelets (×10³/µL)",r'(?:platelets?|plt)[:\s=]+(\d+(?:\.\d+)?)'),
+        ("PCV / Haematocrit (%)",r'(?:pcv|haematocrit|hematocrit)[:\s=]+(\d{1,2}(?:\.\d)?)'),
+        ("MCV (fL)",           r'mcv[:\s=]+(\d{2,3}(?:\.\d)?)'),
+        ("MCH (pg)",           r'mch[:\s=]+(\d{1,2}(?:\.\d)?)'),
+        ("MCHC (g/dL)",        r'mchc[:\s=]+(\d{2,3}(?:\.\d)?)'),
+    ]:
+        m = re.search(pat, t, re.I)
+        if m:
+            val = float(m.group(1))
+            if label.startswith("Haemoglobin") and not (5.0 <= val <= 20.0): continue
+            result[label] = str(val)
+
+    m = re.search(r'(?:spo2|oxygen\s*saturation|o2\s*sat)[:\s=]+(\d{2,3}(?:\.\d)?)\s*%?', t, re.I)
+    if m: result["SpO2 (%)"] = m.group(1)
+
+    m = re.search(r'(?:heart\s*rate|pulse|hr)[:\s=]+(\d{2,3})\s*(?:bpm)?', t, re.I)
+    if m:
+        v = int(m.group(1))
+        if 30 <= v <= 220: result["Heart Rate (bpm)"] = str(v)
+
+    m = re.search(r'(?:temperature|temp)[:\s=]+(\d{2,3}(?:\.\d)?)\s*(?:°?[fc])?', t, re.I)
+    if m: result["Temperature (°F/°C)"] = m.group(1)
+
+    m = re.search(r'respiratory\s*rate[:\s=]+(\d{1,2})', t, re.I)
+    if m: result["Respiratory Rate (/min)"] = m.group(1)
+
+    m = re.search(r'(?:weight|wt)[:\s=]+(\d{2,3}(?:\.\d)?)\s*(?:kg)?', t, re.I)
+    if m:
+        v = float(m.group(1))
+        if 20 <= v <= 250: result["Weight (kg)"] = str(v)
+
+    m = re.search(r'(?:height|ht)[:\s=]+(\d{2,3}(?:\.\d)?)\s*(?:cm)?', t, re.I)
+    if m:
+        v = float(m.group(1))
+        if 50 <= v <= 230: result["Height (cm)"] = str(v)
+
+    m = re.search(r'(?:bmi|body\s*mass\s*index)[:\s=]+(\d{1,2}(?:\.\d{1,2})?)', t, re.I)
+    if m: result["BMI"] = m.group(1)
+
+    for label, pat in [
+        ("Creatinine (mg/dL)",  r'(?:creatinine|creat)[:\s=]+(\d(?:\.\d{1,2})?)'),
+        ("Blood Urea (mg/dL)",  r'(?:blood\s*urea|urea)[:\s=]+(\d{1,3}(?:\.\d)?)'),
+        ("Uric Acid (mg/dL)",   r'uric\s*acid[:\s=]+(\d{1,2}(?:\.\d{1,2})?)'),
+        ("BUN (mg/dL)",         r'bun[:\s=]+(\d{1,3}(?:\.\d)?)'),
+        ("eGFR",                r'egfr[:\s=]+(\d{1,3}(?:\.\d)?)'),
+    ]:
+        m = re.search(pat, t, re.I)
+        if m: result[label] = m.group(1)
+
+    for label, pat in [
+        ("SGPT / ALT (U/L)",   r'(?:sgpt|alt)[:\s=]+(\d{1,4}(?:\.\d)?)'),
+        ("SGOT / AST (U/L)",   r'(?:sgot|ast)[:\s=]+(\d{1,4}(?:\.\d)?)'),
+        ("Bilirubin Total (mg/dL)", r'(?:total\s*bilirubin|bilirubin\s*total)[:\s=]+(\d{1,2}(?:\.\d{1,2})?)'),
+        ("Bilirubin Direct (mg/dL)",r'(?:direct\s*bilirubin)[:\s=]+(\d{1,2}(?:\.\d{1,2})?)'),
+        ("Alkaline Phosphatase (U/L)",r'(?:alkaline\s*phosphatase|alp)[:\s=]+(\d{1,4}(?:\.\d)?)'),
+        ("Total Protein (g/dL)", r'total\s*protein[:\s=]+(\d{1,2}(?:\.\d{1,2})?)'),
+        ("Albumin (g/dL)",       r'albumin[:\s=]+(\d{1,2}(?:\.\d{1,2})?)'),
+    ]:
+        m = re.search(pat, t, re.I)
+        if m: result[label] = m.group(1)
+
+    for label, pat in [
+        ("TSH (mIU/L)", r'tsh[:\s=]+(\d{1,3}(?:\.\d{1,3})?)'),
+        ("T3 (ng/dL)",  r'\bt3\b[:\s=]+(\d{1,3}(?:\.\d{1,2})?)'),
+        ("T4 (µg/dL)",  r'\bt4\b[:\s=]+(\d{1,2}(?:\.\d{1,2})?)'),
+        ("Free T3",     r'free\s*t3[:\s=]+(\d{1,2}(?:\.\d{1,2})?)'),
+        ("Free T4",     r'free\s*t4[:\s=]+(\d{1,2}(?:\.\d{1,2})?)'),
+    ]:
+        m = re.search(pat, t, re.I)
+        if m: result[label] = m.group(1)
+
+    for label, pat in [
+        ("Sodium (mEq/L)",    r'sodium[:\s=]+(\d{2,3}(?:\.\d)?)'),
+        ("Potassium (mEq/L)", r'potassium[:\s=]+(\d{1,2}(?:\.\d{1,2})?)'),
+        ("Chloride (mEq/L)",  r'chloride[:\s=]+(\d{2,3}(?:\.\d)?)'),
+        ("Bicarbonate",       r'bicarbonate[:\s=]+(\d{1,2}(?:\.\d)?)'),
+        ("Calcium (mg/dL)",   r'calcium[:\s=]+(\d{1,2}(?:\.\d{1,2})?)'),
+        ("Phosphorus (mg/dL)",r'phosphorus[:\s=]+(\d{1,2}(?:\.\d{1,2})?)'),
+        ("Magnesium (mg/dL)", r'magnesium[:\s=]+(\d{1,2}(?:\.\d{1,2})?)'),
+    ]:
+        m = re.search(pat, t, re.I)
+        if m: result[label] = m.group(1)
+
+    for label, pat in [
+        ("Vitamin D (ng/mL)",  r'(?:vitamin\s*d|25-?oh)[:\s=]+(\d{1,3}(?:\.\d)?)'),
+        ("Vitamin B12 (pg/mL)",r'(?:vitamin\s*b12|b12)[:\s=]+(\d{1,4}(?:\.\d)?)'),
+        ("Iron (µg/dL)",       r'(?:serum\s*iron|iron)[:\s=]+(\d{1,3}(?:\.\d)?)'),
+        ("Ferritin (ng/mL)",   r'ferritin[:\s=]+(\d{1,4}(?:\.\d)?)'),
+        ("Folate (ng/mL)",     r'folate[:\s=]+(\d{1,2}(?:\.\d)?)'),
+    ]:
+        m = re.search(pat, t, re.I)
+        if m: result[label] = m.group(1)
+
+    for pat in [
+        r'(?:diagnosis|diagnosed\s+(?:as|with)|clinical\s+impression|impression|findings?)[:\s]*([\w\s,\.;\/\-]+?)(?:\n\n|\n[A-Z]|$)',
+        r'(?:disease|condition|disorder)[:\s]*([\w\s,\.;\/\-]+?)(?:\n|$)',
+    ]:
+        m = re.search(pat, t, re.I | re.DOTALL)
+        if m:
+            raw = m.group(1).strip().replace("\n", ", ")
+            raw = re.sub(r'\s{2,}', ' ', raw)
+            if len(raw) > 3: result["Diagnosis / Finding"] = raw[:250]; break
+
+    disease_kw = ["diabetes","hypertension","anemia","anaemia","tuberculosis","malaria","dengue",
+                  "typhoid","asthma","pneumonia","covid","hypothyroidism","hyperthyroidism",
+                  "arthritis","cardiac","heart failure","kidney","hepatitis","fever","infection",
+                  "fracture","obesity","cholesterol","stroke"]
+    hits = [d.capitalize() for d in disease_kw if re.search(r'\b'+d+r'\b', t, re.I)]
+    if hits and "Diagnosis / Finding" not in result:
+        result["Diagnosis / Finding"] = ", ".join(hits[:6])
+
+    drug_kw = ["metformin","amlodipine","atorvastatin","paracetamol","ibuprofen","aspirin",
+               "amoxicillin","azithromycin","cetirizine","omeprazole","losartan","lisinopril",
+               "insulin","levothyroxine","pantoprazole","ciprofloxacin","doxycycline",
+               "prednisolone","montelukast","salbutamol","folic acid","vitamin","calcium",
+               "iron","zinc","metoprolol","atenolol","ramipril","telmisartan","glimepiride"]
+    found_drugs = [d.capitalize() for d in drug_kw if re.search(r'\b'+d+r'\b', t, re.I)]
+    m = re.search(r'(?:rx|prescription|medicines?|drugs?|treatment)[:\s]*([\w\s,\.\-;0-9mg]+?)(?:\n\n|$)', t, re.I | re.DOTALL)
+    if m:
+        result["Medications / Rx"] = m.group(1).strip().replace("\n", ", ")[:300]
+    elif found_drugs:
+        result["Medications / Rx"] = ", ".join(found_drugs[:10])
 
     return result
 
@@ -1545,66 +1538,34 @@ def get_status(field, val_str):
     return "p-ok"
 
 FIELD_TO_DB = {
-    # Normalized keys from dynamic extraction
-    "hemoglobin": "haemoglobin",
-    "hb": "haemoglobin",
-    "hgb": "haemoglobin",
-    "glucose": "sugar",
-    "sugar": "sugar",
-    "cholesterol": "cholesterol",
-    "hdl": "hdl",
-    "ldl": "ldl",
-    "triglycerides": "triglycerides",
-    "creatinine": "creatinine",
-    "urea": "urea",
-    "uricacid": "uric_acid",
-    "bun": "urea",  # BUN maps to urea
-    "tsh": "tsh",
-    "t3": "t3",
-    "t4": "t4",
-    "sodium": "sodium",
-    "potassium": "potassium",
-    "calcium": "calcium",
-    "phosphorus": "phosphorus",
-    "magnesium": "magnesium",
-    "vitamind": "vitamin_d",
-    "vitaminb12": "vitamin_b12",
-    "iron": "iron",
-    "ferritin": "ferritin",
-    "folate": "folate",
-    "hba1c": "hba1c",
-    "egfr": "egfr",
-    "sgpt": "sgpt",
-    "sgot": "sgot",
-    "alt": "sgpt",
-    "ast": "sgot",
-    "bilirubin": "bilirubin_total",
-    "albumin": "albumin",
-    "protein": "total_protein",
-    "wbc": "wbc",
-    "rbc": "rbc",
-    "platelets": "platelets",
-    "pcv": "pcv",
-    "mcv": "mcv",
-    "mch": "mch",
-    "mchc": "mchc",
-    "spo2": "spo2",
-    "oxygen": "spo2",
-    "saturation": "spo2",
-    "heartrate": "heart_rate",
-    "pulse": "heart_rate",
-    "hr": "heart_rate",
-    "bpsystolic": "bp_systolic",
-    "bpdiastolic": "bp_diastolic",
-    "bp_systolic": "bp_systolic",
-    "bp_diastolic": "bp_diastolic",
-    "weight": "weight",
-    "height": "height",
-    "bmi": "bmi",
-    "temperature": "temperature",
-    "temp": "temperature",
-    "respiratoryrate": "respiratory_rate",
-    "rr": "respiratory_rate",
+    "BP Systolic (mmHg)":          "bp_systolic",
+    "BP Diastolic (mmHg)":         "bp_diastolic",
+    "Fasting Blood Sugar (mg/dL)": "sugar",
+    "Random Blood Sugar (mg/dL)":  "sugar",
+    "Blood Glucose (mg/dL)":       "sugar",
+    "HbA1c (%)":                   "hba1c",
+    "Cholesterol (mg/dL)":         "cholesterol",
+    "Total Cholesterol (mg/dL)":   "cholesterol",
+    "LDL Cholesterol (mg/dL)":     "ldl",
+    "HDL Cholesterol (mg/dL)":     "hdl",
+    "Triglycerides (mg/dL)":       "triglycerides",
+    "Haemoglobin (g/dL)":          "haemoglobin",
+    "WBC Count (×10³/µL)":         "wbc",
+    "RBC Count (×10⁶/µL)":         "rbc",
+    "Platelets (×10³/µL)":         "platelets",
+    "SpO2 (%)":                    "spo2",
+    "Heart Rate (bpm)":            "heart_rate",
+    "Weight (kg)":                 "weight",
+    "Height (cm)":                 "height",
+    "BMI":                         "bmi",
+    "Creatinine (mg/dL)":          "creatinine",
+    "Blood Urea (mg/dL)":          "urea",
+    "Uric Acid (mg/dL)":           "uric_acid",
+    "TSH (mIU/L)":                 "tsh",
+    "Diagnosis / Finding":         "diagnosis",
+    "Medications / Rx":            "medicines",
+    "Doctor":                      "doctor_name",
+    "Hospital / Lab":              "lab_name",
 }
 
 # ╔══════════════════════════════════════════════════════════════════╗
@@ -1759,73 +1720,38 @@ def generate_analysis(extracted):
 # ║  PAGE: LANDING (public, pre-login)                              ║
 # ╚══════════════════════════════════════════════════════════════════╝
 def page_landing():
-    image_path = os.path.join(os.path.dirname(__file__), "police.png")
-    if os.path.exists(image_path):
-        with open(image_path, "rb") as img_file:
-            img_base64 = base64.b64encode(img_file.read()).decode()
-        st.markdown(f"""
-        <style>
-        .hero-bg {{
-          position: relative;
-          background-color: #091a2b;
-          background-image: linear-gradient(rgba(0,0,0,0.3), rgba(0,0,0,0.3)),
-                            url("data:image/png;base64,{img_base64}");
-          background-size: contain;
-          background-position: center center;
-          background-repeat: no-repeat;
-          border: 1.5px solid var(--border);
-          border-radius: 22px;
-          padding: 3.5rem 3rem 2.5rem;
-          margin-bottom: 1.6rem;
-          box-shadow: var(--shadow-lg);
-          min-height: 420px;
-        }}
-        .hero-bg, .hero-bg *, .hero-bg div, .hero-bg span, .hero-bg p, .hero-bg h1, .hero-bg h2 {{
-          color: #ffffff !important;
-          -webkit-text-fill-color: #ffffff !important;
-        }}
-        .hero-bg .hero-deco, .hero-bg .hero-badge,
-        .hero-bg div[style*="font-size:3.8rem"],
-        .hero-bg div[style*="font-size:1.02rem"],
-        .hero-bg .hero-stat-lbl,
-        .hero-bg .hero-stat-val,
-        .hero-bg span {{ color: #ffffff !important; }}
-        .hero-bg .hero-badge {{ text-shadow: 2px 2px 6px rgba(0,0,0,0.6); }}
-        </style>
-        """, unsafe_allow_html=True)
-
     st.markdown("""
-    <div class="hero-bg">
+    <div class="hero-banner">
       <div class="hero-deco">🛡️</div>
-      <div style="max-width:700px;position:relative;z-index:1;">
-        <div class="hero-badge">
+      <div style="max-width:700px;position:relative;z-index:1;color:var(--navy) !important;">
+        <div class="hero-badge" style="color:var(--gold2) !important;">
           🛡️ &nbsp; Mumbai Police Wellness Division · Est. 2024
         </div>
         <div style="font-family:'Rajdhani',sans-serif;font-size:3.8rem;font-weight:700;
-                    line-height:1.05;margin-bottom:.6rem;">
-          Smart Health for<br><span>Brave Officers</span>
+                    line-height:1.05;margin-bottom:.6rem;color:var(--navy) !important;">
+          Smart Health for<br><span style="color:var(--gold3) !important;">Brave Officers</span>
         </div>
-        <div style="font-size:1.02rem;max-width:600px;line-height:1.8;margin-bottom:1.8rem;">
+        <div style="color:var(--text2) !important;font-size:1.02rem;max-width:600px;line-height:1.8;margin-bottom:1.8rem;">
           SHIELD is Mumbai Police's dedicated health intelligence platform.
           Track vitals, upload lab reports, receive AI-powered analysis and stay
           connected to 21 empanelled hospitals — all in one secure dashboard.
         </div>
         <div class="hero-stats">
           <div class="hero-stat">
-            <div class="hero-stat-val">21</div>
-            <div class="hero-stat-lbl">Empanelled Hospitals</div>
+            <div class="hero-stat-val" style="color:#f0a020 !important;">21</div>
+            <div class="hero-stat-lbl" style="color:#7a96c4 !important;">Empanelled Hospitals</div>
           </div>
           <div class="hero-stat">
-            <div class="hero-stat-val">₹300</div>
-            <div class="hero-stat-lbl">6-Test Package</div>
+            <div class="hero-stat-val" style="color:#f0a020 !important;">₹300</div>
+            <div class="hero-stat-lbl" style="color:#7a96c4 !important;">6-Test Package</div>
           </div>
           <div class="hero-stat">
-            <div class="hero-stat-val">AI</div>
-            <div class="hero-stat-lbl">PDF + Image OCR</div>
+            <div class="hero-stat-val" style="color:#f0a020 !important;">AI</div>
+            <div class="hero-stat-lbl" style="color:#7a96c4 !important;">PDF + Image OCR</div>
           </div>
           <div class="hero-stat">
-            <div class="hero-stat-val">100%</div>
-            <div class="hero-stat-lbl">Confidential</div>
+            <div class="hero-stat-val" style="color:#f0a020 !important;">100%</div>
+            <div class="hero-stat-lbl" style="color:#7a96c4 !important;">Confidential</div>
           </div>
         </div>
       </div>
@@ -2532,27 +2458,17 @@ def page_upload():
 # ╚══════════════════════════════════════════════════════════════════╝
 def page_report():
     page_header("🤖", "AI Upload Report", "OCR + AI extracts every parameter into a structured table")
-    
-    # ────────────────────────────────────────────────────────────────
-    # Show warning if Tesseract is not available
-    # ────────────────────────────────────────────────────────────────
-    if not TESSERACT_AVAILABLE:
-        st.warning("OCR not available: Tesseract missing on server")
-        return
-    
-    # ────────────────────────────────────────────────────────────────
-    # OCR is available - show normal interface
-    # ────────────────────────────────────────────────────────────────
+
     card_open("How AI Report Analysis Works")
     st.markdown("""<div style="font-size:.9rem;color:#2d3f6b !important;line-height:1.9">
       <b style="color:#d9880c !important;">Step 1:</b> Upload your lab report (PDF, JPG or PNG) — up to 50 MB.<br>
-      <b style="color:#d9880c !important;">Step 2:</b> PDF is converted to images, then OCR extracts text.<br>
-      <b style="color:#d9880c !important;">Step 3:</b> AI detects and normalizes every health parameter.<br>
+      <b style="color:#d9880c !important;">Step 2:</b> PDF is converted to images via pdf2image + Poppler, then OCR reads all text.<br>
+      <b style="color:#d9880c !important;">Step 3:</b> AI extracts <em>every</em> detectable field into a clean grouped table.<br>
       <b style="color:#d9880c !important;">Step 4:</b> Review results and save directly to your health profile.
       <br><br>
       <span style="color:#5a6f99 !important;font-size:.82rem">
-        ✅ Tesseract OCR: Active &nbsp;|&nbsp; 
-        PyMuPDF (PDF support): """ + ("✅ Active" if FITZ_AVAILABLE else "❌ Inactive") + """
+        ℹ️ Tesseract path: <code>C:\\Program Files\\Tesseract-OCR\\tesseract.exe</code> &nbsp;|&nbsp;
+        Poppler path: <code>C:\\poppler\\Library\\bin</code>
       </span>
     </div>""", unsafe_allow_html=True)
     card_close()
@@ -2569,12 +2485,12 @@ def page_report():
 
     size_mb = len(up.getvalue()) / (1024 * 1024)
     if size_mb > 50:
-        st.error(f"❌ File too large: {size_mb:.1f} MB (max 50 MB)")
+        st.markdown(f"""<div class="alert-box alert-danger">🚫 File too large: {size_mb:.1f} MB. Max 50 MB.</div>""", unsafe_allow_html=True)
         return
 
     is_pdf = "pdf" in up.type.lower() or up.name.lower().endswith(".pdf")
     file_type_label = "PDF" if is_pdf else "Image"
-    st.success(f"✅ Ready: {up.name} ({size_mb:.2f} MB) · {file_type_label}")
+    st.markdown(f"""<div class="alert-box alert-ok">✅ File ready: <b>{up.name}</b> ({size_mb:.2f} MB) · {file_type_label}</div>""", unsafe_allow_html=True)
 
     if not st.button("🤖  EXTRACT & ANALYSE →", use_container_width=True):
         return
@@ -2584,105 +2500,84 @@ def page_report():
         raw_text, ocr_error = extract_text_ocr(up)
 
     if ocr_error:
-        st.error(f"❌ OCR Processing Failed")
-        st.error(f"**Error:** {ocr_error}")
-        st.info("""
-        **Troubleshooting:**
-        - Ensure the image is clear and at least 300 DPI
-        - Try a different file format (JPG, PNG, or PDF)
-        - The file may be corrupted or unreadable
-        """)
-        logger.error(f"[PAGE] OCR extraction failed: {ocr_error}")
+        st.markdown(f"""<div class="ocr-error">
+          ❌ <b>OCR Failed</b> — here is the actual error:<br>
+          <pre>{ocr_error}</pre>
+        </div>""", unsafe_allow_html=True)
+        st.info("Fix the error above and re-upload.")
         return
 
     if not raw_text or len(raw_text.strip()) < 20:
-        st.warning("⚠️ OCR succeeded but extracted very little text")
-        st.info("Ensure the file is a clear scan or image at 300+ DPI")
-        st.text_area("Extracted Text Preview:", value=raw_text[:1000] if raw_text else "(empty))", height=150)
-        logger.warning("[PAGE] OCR returned minimal text")
+        st.markdown("""<div class="alert-box alert-warn">
+          ⚠️ OCR succeeded but extracted very little text.
+          Ensure the file is a clear scan at 300+ DPI.
+        </div>""", unsafe_allow_html=True)
         return
 
-    # ── Safe extraction pipeline ──
-    try:
-        cleaned = clean_ocr_text(raw_text)
-        logger.info(f"[PAGE] OCR text cleaned: {len(cleaned)} chars")
-        
-        st.text("OCR TEXT PREVIEW:")
-        st.text(raw_text[:1500])
-        
-        patient_details = extract_patient_details(cleaned)
-        logger.info(f"[PAGE] Patient details extracted: {patient_details}")
-        
-        with st.spinner("🧠 AI extracting all parameters..."):
-            extracted = extract_all_fields(cleaned)
-        
-        logger.info(f"[PAGE] Parameters extracted: {len(extracted)} fields")
-    
-    except Exception as e:
-        st.error(f"❌ Error during extraction pipeline: {str(e)}")
-        logger.error(f"[PAGE] Extraction pipeline error: {str(e)}")
-        st.text_area("Raw OCR Output:", value=raw_text[:2000], height=200)
-        return
+    cleaned = clean_ocr_text(raw_text)
+
+    with st.spinner("🧠 AI extracting all parameters..."):
+        extracted = extract_all_fields(cleaned)
 
     total_found = len(extracted)
     if total_found == 0:
-        st.warning("⚠️ No medical parameters could be detected")
-        st.info("""
-        The OCR text may not contain health-related values. Try:
-        - Upload a different medical report
-        - Ensure the document has clear medical parameters
-        """)
-        st.text_area("Raw OCR Output:", value=cleaned[:2000], height=200)
-        logger.warning("[PAGE] No parameters extracted from document")
+        st.markdown("""<div class="alert-box alert-warn">⚠️ No parameters detected.</div>""", unsafe_allow_html=True)
+        st.text_area("OCR Output:", value=cleaned[:2000], height=200)
         return
 
-    st.success(f"✅ Successfully extracted {total_found} parameter(s)")
+    st.success(f"✅ {total_found} field(s) successfully extracted.")
 
-    # ── Auto-save with error handling ──
-    try:
-        db_rec = {"source": "AI Report Upload", "record_date": str(datetime.date.today())}
-        for field, val in extracted.items():
-            db_col = FIELD_TO_DB.get(field.lower())
-            if db_col:
-                try:
-                    db_rec[db_col] = float(val)
-                except (ValueError, TypeError):
-                    db_rec[db_col] = str(val)
+    # Generate and display analysis
+    analysis = generate_analysis(extracted)
+    st.markdown("### 🩺 Health Analysis")
+    st.markdown(f"**Overall Status:** {analysis['status']}")
+    if analysis['concerns']:
+        st.markdown("**Key Concerns:** " + ", ".join(analysis['concerns']))
+    if analysis['suggestions']:
+        st.markdown("**Suggestions:** " + "; ".join(analysis['suggestions']))
 
-        if "weight" in db_rec and "height" in db_rec and not db_rec.get("bmi"):
+    # Auto-save immediately after extraction
+    db_rec = {"source": "AI Report Upload", "record_date": parse_report_date(extracted.get("Report Date"))}
+    for field, val in extracted.items():
+        db_col = FIELD_TO_DB.get(field)
+        if db_col:
             try:
-                h = float(db_rec["height"])
-                w = float(db_rec["weight"])
-                if h > 0:
-                    db_rec["bmi"] = round(w / ((h / 100) ** 2), 1)
+                if db_col in ("diagnosis","medicines","doctor_name","lab_name"):
+                    db_rec[db_col] = str(val)
+                else:
+                    db_rec[db_col] = float(str(val).replace(",",""))
             except:
-                pass
+                db_rec[db_col] = str(val)
 
-        db_rec["notes"] = f"AI-extracted from {up.name}. Patient: {patient_details.get('patient_name','Unknown')}"
-        saved_id = save_health_record(st.session_state.username, db_rec)
-        
-        if saved_id:
-            st.session_state.force_select_id = saved_id
-            update_user_field(st.session_state.username, last_checkup=db_rec["record_date"])
-            st.session_state.record_just_saved = True
-            st.session_state.save_ts = time.time()
-            st.session_state.current_report_data = db_rec.copy()
-            st.session_state.current_report_data["id"] = saved_id
-            st.success("""✅ Record saved successfully!""")
-            st.info(f"""
-            **Extraction Summary:**
-            - **Parameters extracted:** {total_found}
-            - **Values stored:** {len([k for k in db_rec if k not in ("source","record_date")])}
-            - **Location:** Health History · Health Charts · Fitness Score
-            """)
-            logger.info(f"[PAGE] Record saved successfully: ID={saved_id}, {total_found} params")
-        else:
-            st.error("❌ Failed to save the record to database")
-            logger.error("[PAGE] Failed to save health record")
-    
-    except Exception as save_err:
-        st.error(f"❌ Error saving record: {str(save_err)}")
-        logger.error(f"[PAGE] Record save error: {str(save_err)}")
+    if "weight" in db_rec and "height" in db_rec and not db_rec.get("bmi"):
+        try:
+            h = float(db_rec["height"])
+            w = float(db_rec["weight"])
+            if h > 0:
+                db_rec["bmi"] = round(w / ((h / 100) ** 2), 1)
+        except:
+            pass
+
+    db_rec["notes"] = f"AI-extracted from {up.name}. Patient: {extracted.get('Patient Name','Unknown')}"
+    saved_id = save_health_record(st.session_state.username, db_rec)
+    if saved_id:
+        st.session_state.force_select_id = saved_id
+        update_user_field(st.session_state.username, last_checkup=db_rec["record_date"])
+        st.session_state.record_just_saved = True
+        st.session_state.save_ts = time.time()
+        st.session_state.current_report_data = db_rec.copy()
+        st.session_state.current_report_data["id"] = saved_id
+        st.markdown(f"""<div class="save-success">
+          <div class="save-success-icon">✅</div>
+          <div class="save-success-text">
+            Record saved! <b>{total_found} fields</b> extracted, <b>{len([k for k in db_rec if k not in ("source","record_date","diagnosis","medicines","doctor_name","lab_name","notes")])} numeric values</b> stored.<br>
+            <span style="font-size:.85rem;font-weight:400;color:#0a6b3e !important;">
+              Live in: <b>Health History · Health Charts · Fitness Score · Prediction · Welcome</b>
+            </span>
+          </div>
+        </div>""", unsafe_allow_html=True)
+    else:
+        st.error("Failed to save the record. Please try again.")
 
     tab_full, tab_grouped, tab_vitals, tab_ocr = st.tabs([
         "📊 Full Extraction Table",
@@ -2690,63 +2585,6 @@ def page_report():
         "💊 Visual Vitals",
         "📄 Raw OCR Text",
     ])
-
-    # Fit/Unfit Logic
-    fit_status = "FIT"
-    abnormal_values = []
-
-    # Generic abnormal safety checks
-    for key, value in extracted.items():
-        if not isinstance(value, (int, float)):
-            continue
-        if key in ('age', 'gender', 'patient_name', 'report_date'):
-            continue
-        if value > 200 or value < 50:
-            fit_status = "UNFIT"
-            abnormal_values.append(key.replace('_', ' ').title())
-
-    # Specific health thresholds
-    if extracted.get('bp_systolic', 0) > 140 or extracted.get('bp_diastolic', 0) > 90:
-        fit_status = "UNFIT"
-        abnormal_values.append("Blood Pressure")
-    if extracted.get('hemoglobin', 0) < 10:
-        fit_status = "UNFIT"
-        abnormal_values.append("Hemoglobin")
-    if extracted.get('sugar', 0) > 140 or extracted.get('glucose', 0) > 140:
-        fit_status = "UNFIT"
-        abnormal_values.append("Blood Sugar")
-    if extracted.get('cholesterol', 0) > 200:
-        fit_status = "UNFIT"
-        abnormal_values.append("Cholesterol")
-
-    # Display fit/unfit result
-    if fit_status == "FIT":
-        st.success("FIT ✅")
-    else:
-        st.error(f"UNFIT ❌ - Abnormal parameters: {', '.join(sorted(set(abnormal_values)))}")
-
-    # Display extracted parameters table
-    display_data = []
-    for label, value in [
-        ("Patient Name", patient_details.get('patient_name', '—')),
-        ("Age", patient_details.get('age', '—')),
-        ("Gender", patient_details.get('gender', '—')),
-        ("Report Date", patient_details.get('report_date', '—')),
-    ]:
-        if value != '—':
-            display_data.append({"Parameter": label, "Value": value})
-
-    for key, value in extracted.items():
-        readable_key = key.replace('bp_systolic', 'BP Systolic').replace('bp_diastolic', 'BP Diastolic')
-        readable_key = ' '.join(word.capitalize() for word in readable_key.split('_'))
-        display_data.append({"Parameter": readable_key, "Value": value})
-
-    if display_data:
-        st.markdown("### 📊 Extracted Medical Parameters")
-        df = pd.DataFrame(display_data)
-        st.dataframe(df, use_container_width=True)
-    else:
-        st.warning("⚠️ No medical values detected in the uploaded report")
 
 
 # ╔══════════════════════════════════════════════════════════════════╗
