@@ -1,9 +1,0 @@
-streamlit
-pandas
-numpy
-pillow
-pytesseract
-openpyxl
-matplotlib
-poppler-utils
-tesseract-ocr
