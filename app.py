@@ -1276,64 +1276,105 @@ def extract_text_ocr(uploaded):
         return "", f"Unexpected OCR error: {str(e)}"
 
 def clean_ocr_text(raw: str) -> str:
-    lines = raw.splitlines()
-    clean = []
-    for line in lines:
-        line = line.strip()
-        if len(line) < 2: continue
-        if re.match(r'^[\W_]+$', line): continue
-        clean.append(line)
-    return "\n".join(clean)
+    raw = raw.replace('\r', '\n')
+    lines = []
+    for line in raw.splitlines():
+        line = re.sub(r'\s+', ' ', line).strip()
+        if len(line) < 2:
+            continue
+        if re.match(r'^[\W_]+$', line):
+            continue
+        lines.append(line.lower())
+    return "\n".join(lines)
 
-# ╔══════════════════════════════════════════════════════════════════╗
-# ║  AI REPORT EXTRACTION ENGINE                                    ║
-# ╚══════════════════════════════════════════════════════════════════╝
+
+def extract_patient_details(text: str) -> dict:
+    details = {}
+
+    name_match = re.search(r'(?:patient name|name)\s*[:\-]\s*([a-z][a-z\s\.\-]{2,})', text, re.IGNORECASE)
+    if name_match:
+        details['patient_name'] = name_match.group(1).strip().title()
+
+    age_match = re.search(r'\b(?:age|years old|yrs|yrs\.)\b\s*[:\-]?\s*(\d{1,3})', text, re.IGNORECASE)
+    if age_match:
+        details['age'] = int(age_match.group(1))
+
+    gender_match = re.search(r'\b(?:gender|sex)\b\s*[:\-]?\s*(male|female|other|m|f)\b', text, re.IGNORECASE)
+    if gender_match:
+        gender_value = gender_match.group(1).lower()
+        if gender_value == 'm':
+            gender_value = 'male'
+        elif gender_value == 'f':
+            gender_value = 'female'
+        details['gender'] = gender_value.title()
+
+    date_match = re.search(
+        r'\b(?:report date|date of report|date)\b\s*[:\-]?\s*([0-3]?\d[\/\-\.\s][01]?\d[\/\-\.\s]\d{2,4}|[A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4})',
+        text,
+        re.IGNORECASE,
+    )
+    if date_match:
+        details['report_date'] = parse_report_date(date_match.group(1))
+
+    return details
+
+
 def extract_all_fields(text: str) -> dict:
-    """Dynamic extraction of ALL medical values from OCR text"""
+    """Dynamic extraction of ALL values from OCR text."""
     result = {}
-    t = text.lower()  # Work with lowercase for easier matching
+    lines = [re.sub(r'\s+', ' ', line).strip() for line in text.splitlines() if line.strip()]
 
-    # Extract ALL medical values dynamically using regex patterns
-    # Pattern 1: "Parameter: value" or "Parameter value"
-    # Pattern 2: "Parameter: value unit"
-    patterns = [
-        r'([a-zA-Z][a-zA-Z\s]{2,30}?)\s*[:=]\s*(\d+(?:\.\d{1,2})?)',  # Parameter: value
-        r'([a-zA-Z][a-zA-Z\s]{2,30}?)\s+(\d+(?:\.\d{1,2})?)',          # Parameter value
-        r'([a-zA-Z][a-zA-Z\s]{2,30}?)\s*[:=]\s*(\d+(?:\.\d{1,2})?)\s*[a-zA-Z/%²³μ]+',  # Parameter: value unit
-    ]
+    pattern1 = re.compile(r'([A-Za-z][A-Za-z \(\)%/\-]{2,})\s*[:\-]?\s*(\d+\.?\d*)')
+    pattern2 = re.compile(r'([A-Za-z][A-Za-z \(\)%/\-]{2,})\s+(\d+\.?\d*)\s*(?:mg/dl|g/dl|mmhg|%|bpm|kg|cm|mmol/l|µg/dl|ng/ml)?', re.IGNORECASE)
 
-    medical_keywords = {
-        'hemoglobin', 'hb', 'hgb', 'glucose', 'sugar', 'cholesterol', 'hdl', 'ldl', 'triglycerides',
-        'creatinine', 'urea', 'uric acid', 'bun', 'bilirubin', 'sgpt', 'sgot', 'alt', 'ast',
-        'albumin', 'protein', 'tsh', 't3', 't4', 'sodium', 'potassium', 'calcium', 'phosphorus',
-        'wbc', 'rbc', 'platelets', 'pcv', 'mcv', 'mch', 'mchc', 'spo2', 'oxygen', 'saturation',
-        'heart rate', 'pulse', 'hr', 'blood pressure', 'bp', 'systolic', 'diastolic',
-        'weight', 'height', 'bmi', 'temperature', 'temp', 'respiratory rate', 'rr',
-        'vitamin d', 'vitamin b12', 'iron', 'ferritin', 'folate', 'hba1c', 'egfr'
-    }
+    for line in lines:
+        # Pattern 1 and 2 matches
+        for match in pattern1.findall(line):
+            label = match[0].strip()
+            value = match[1]
+            if len(re.sub(r'[^A-Za-z]', '', label)) < 3:
+                continue
+            key = re.sub(r'[^a-z0-9]+', '_', label.lower()).strip('_')
+            if key in ('age', 'gender', 'patient_name', 'report_date'):
+                continue
+            try:
+                result[key] = float(value)
+            except ValueError:
+                continue
 
-    for pattern in patterns:
-        matches = re.findall(pattern, t, re.IGNORECASE | re.MULTILINE)
-        for param_name, value in matches:
-            param_name = param_name.strip().lower()
-            # Check if this looks like a medical parameter
-            if any(keyword in param_name for keyword in medical_keywords) or len(param_name) > 3:
-                # Normalize key: lowercase, remove spaces and special chars
-                normalized_key = re.sub(r'[^a-z0-9]', '', param_name)
-                try:
-                    # Try to convert to float
-                    numeric_value = float(value)
-                    result[normalized_key] = numeric_value
-                except ValueError:
-                    continue
+        for match in pattern2.findall(line):
+            label = match[0].strip()
+            value = match[1]
+            if len(re.sub(r'[^A-Za-z]', '', label)) < 3:
+                continue
+            key = re.sub(r'[^a-z0-9]+', '_', label.lower()).strip('_')
+            if key in ('age', 'gender', 'patient_name', 'report_date'):
+                continue
+            try:
+                result[key] = float(value)
+            except ValueError:
+                continue
 
-    # Special handling for blood pressure (systolic/diastolic)
-    bp_pattern = r'(\d{2,3})\s*/\s*(\d{2,3})'
-    bp_match = re.search(bp_pattern, t)
+        # Tabular line handling: text + numeric value on the same line
+        parts = re.split(r'\t|\s{2,}', line)
+        if len(parts) >= 2:
+            candidate_value = parts[-1].strip()
+            value_match = re.match(r'^(\d+\.?\d*)$', candidate_value)
+            if value_match:
+                label = ' '.join(parts[:-1]).strip()
+                if len(re.sub(r'[^A-Za-z]', '', label)) >= 3:
+                    key = re.sub(r'[^a-z0-9]+', '_', label.lower()).strip('_')
+                    if key not in ('age', 'gender', 'patient_name', 'report_date'):
+                        try:
+                            result[key] = float(value_match.group(1))
+                        except ValueError:
+                            pass
+
+    # Special handling for blood pressure values
+    bp_match = re.search(r'(?:bp|blood pressure)[^\d]*(\d{2,3})\s*/\s*(\d{2,3})', text, re.IGNORECASE)
     if bp_match:
-        systolic, diastolic = map(float, bp_match.groups())
-        result['bpsystolic'] = systolic
-        result['bpdiastolic'] = diastolic
+        result['bp_systolic'] = float(bp_match.group(1))
+        result['bp_diastolic'] = float(bp_match.group(2))
 
     return result
 
@@ -1453,6 +1494,8 @@ FIELD_TO_DB = {
     "hr": "heart_rate",
     "bpsystolic": "bp_systolic",
     "bpdiastolic": "bp_diastolic",
+    "bp_systolic": "bp_systolic",
+    "bp_diastolic": "bp_diastolic",
     "weight": "weight",
     "height": "height",
     "bmi": "bmi",
@@ -2445,6 +2488,10 @@ def page_report():
 
     cleaned = clean_ocr_text(raw_text)
 
+    st.text("OCR TEXT:")
+    st.text(raw_text[:1500])
+
+    patient_details = extract_patient_details(cleaned)
     with st.spinner("🧠 AI extracting all parameters..."):
         extracted = extract_all_fields(cleaned)
 
@@ -2475,7 +2522,7 @@ def page_report():
         except:
             pass
 
-    db_rec["notes"] = f"AI-extracted from {up.name}. Patient: {extracted.get('Patient Name','Unknown')}"
+    db_rec["notes"] = f"AI-extracted from {up.name}. Patient: {patient_details.get('patient_name','Unknown')}"
     saved_id = save_health_record(st.session_state.username, db_rec)
     if saved_id:
         st.session_state.force_select_id = saved_id
@@ -2507,44 +2554,56 @@ def page_report():
     fit_status = "FIT"
     abnormal_values = []
 
-    # Check basic health rules
-    if extracted.get('bpsystolic', 0) > 140 or extracted.get('bpsystolic', 0) < 90:
+    # Generic abnormal safety checks
+    for key, value in extracted.items():
+        if not isinstance(value, (int, float)):
+            continue
+        if key in ('age', 'gender', 'patient_name', 'report_date'):
+            continue
+        if value > 200 or value < 50:
+            fit_status = "UNFIT"
+            abnormal_values.append(key.replace('_', ' ').title())
+
+    # Specific health thresholds
+    if extracted.get('bp_systolic', 0) > 140 or extracted.get('bp_diastolic', 0) > 90:
         fit_status = "UNFIT"
         abnormal_values.append("Blood Pressure")
-    if extracted.get('bpdiastolic', 0) > 90 or extracted.get('bpdiastolic', 0) < 60:
+    if extracted.get('hemoglobin', 0) < 10:
         fit_status = "UNFIT"
-        abnormal_values.append("Blood Pressure")
-    if extracted.get('glucose', 0) > 140 or extracted.get('sugar', 0) > 140:
+        abnormal_values.append("Hemoglobin")
+    if extracted.get('sugar', 0) > 140 or extracted.get('glucose', 0) > 140:
         fit_status = "UNFIT"
         abnormal_values.append("Blood Sugar")
     if extracted.get('cholesterol', 0) > 200:
         fit_status = "UNFIT"
         abnormal_values.append("Cholesterol")
-    if extracted.get('hemoglobin', 0) < 10:
-        fit_status = "UNFIT"
-        abnormal_values.append("Hemoglobin")
 
     # Display fit/unfit result
     if fit_status == "FIT":
-        st.success("✅ **FIT** - All parameters within normal range")
+        st.success("FIT ✅")
     else:
-        st.error(f"❌ **UNFIT** - Abnormal values detected: {', '.join(set(abnormal_values))}")
+        st.error(f"UNFIT ❌ - Abnormal parameters: {', '.join(sorted(set(abnormal_values)))}")
 
     # Display extracted parameters table
-    if extracted:
-        st.markdown("### 📊 Extracted Medical Parameters")
-        # Convert to display format
-        display_data = []
-        for key, value in extracted.items():
-            # Convert normalized key back to readable format
-            readable_key = key.replace('bpsystolic', 'BP Systolic').replace('bpdiastolic', 'BP Diastolic')
-            readable_key = ' '.join(word.capitalize() for word in readable_key.split())
-            display_data.append({"Parameter": readable_key, "Value": value})
+    display_data = []
+    for label, value in [
+        ("Patient Name", patient_details.get('patient_name', '—')),
+        ("Age", patient_details.get('age', '—')),
+        ("Gender", patient_details.get('gender', '—')),
+        ("Report Date", patient_details.get('report_date', '—')),
+    ]:
+        if value != '—':
+            display_data.append({"Parameter": label, "Value": value})
 
-        if display_data:
-            st.table(display_data)
-        else:
-            st.warning("⚠️ No medical values detected in the uploaded report")
+    for key, value in extracted.items():
+        readable_key = key.replace('bp_systolic', 'BP Systolic').replace('bp_diastolic', 'BP Diastolic')
+        readable_key = ' '.join(word.capitalize() for word in readable_key.split('_'))
+        display_data.append({"Parameter": readable_key, "Value": value})
+
+    if display_data:
+        st.markdown("### 📊 Extracted Medical Parameters")
+        df = pd.DataFrame(display_data)
+        st.dataframe(df, use_container_width=True)
     else:
         st.warning("⚠️ No medical values detected in the uploaded report")
 
