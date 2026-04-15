@@ -5,4 +5,5 @@ pillow
 pytesseract
 openpyxl
 matplotlib
-PyMuPDF
+poppler-utils
+tesseract-ocr
