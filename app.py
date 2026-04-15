@@ -29,76 +29,53 @@ TESSERACT_AVAILABLE = False
 TESSERACT_ERROR = None
 pytesseract = None
 
-def setup_tesseract():
+def init_tesseract():
     """
-    Initialize Tesseract OCR for both Windows (local dev) and Linux (Render cloud).
-    Safely handles missing Tesseract without crashing the app.
+    Initialize Tesseract OCR safely for any OS.
+    Uses shutil.which("tesseract") as primary detection method.
+    Never crashes if Tesseract is missing.
     """
     global TESSERACT_AVAILABLE, TESSERACT_ERROR, pytesseract
     
     try:
         import pytesseract as pyt
         pytesseract = pyt
-        logger.info("[OCR] pytesseract library imported successfully")
+        logger.info("[OCR] pytesseract imported successfully")
         
-        system_os = platform.system()
-        logger.info(f"[OCR] Detected OS: {system_os}")
-        
-        # ── Windows: Try standard path, fallback to system PATH ──
-        if system_os == "Windows":
-            standard_path = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+        # Primary method: Use shutil.which("tesseract")
+        tesseract_path = shutil.which("tesseract")
+        if tesseract_path:
+            pytesseract.pytesseract.tesseract_cmd = tesseract_path
+            logger.info(f"[OCR] Using tesseract at: {tesseract_path}")
             
-            if os.path.exists(standard_path):
-                pytesseract.pytesseract.tesseract_cmd = standard_path
-                logger.info(f"[OCR] Using standard Windows path: {standard_path}")
-            else:
-                # Fallback to system PATH
-                tesseract_path = shutil.which("tesseract")
-                if tesseract_path:
-                    pytesseract.pytesseract.tesseract_cmd = tesseract_path
-                    logger.info(f"[OCR] Using system PATH tesseract: {tesseract_path}")
-                else:
-                    raise FileNotFoundError("Tesseract not found in standard path or system PATH")
-        
-        # ── Linux/Mac: Use system PATH (Render, Docker, etc.) ──
+            # Test if it actually works
+            try:
+                version = pytesseract.get_tesseract_version()
+                logger.info(f"[OCR] Tesseract version: {version}")
+                TESSERACT_AVAILABLE = True
+                logger.info("[OCR] ✅ Tesseract initialized successfully")
+                return True
+            except Exception as test_err:
+                TESSERACT_ERROR = f"Tesseract found but not working: {str(test_err)}"
+                logger.error(f"[OCR] ❌ {TESSERACT_ERROR}")
+                return False
         else:
-            tesseract_path = shutil.which("tesseract")
-            if tesseract_path:
-                pytesseract.pytesseract.tesseract_cmd = tesseract_path
-                logger.info(f"[OCR] Using system tesseract: {tesseract_path}")
-            else:
-                raise FileNotFoundError("Tesseract not found in system PATH")
-        
-        # ── Test if Tesseract actually works ──
-        try:
-            version = pytesseract.get_tesseract_version()
-            logger.info(f"[OCR] Tesseract version: {version}")
-            TESSERACT_AVAILABLE = True
-            logger.info("[OCR] ✅ Tesseract initialized successfully")
-            return True
-        
-        except Exception as test_err:
-            TESSERACT_ERROR = f"Tesseract found but not working: {str(test_err)}"
-            logger.error(f"[OCR] ❌ {TESSERACT_ERROR}")
+            TESSERACT_ERROR = "Tesseract not found in system PATH"
+            logger.warning(f"[OCR] ⚠️ {TESSERACT_ERROR}")
             return False
     
     except ImportError as import_err:
         TESSERACT_ERROR = "pytesseract library not installed"
-        logger.warning(f"[OCR] ⚠️  {TESSERACT_ERROR}: {str(import_err)}")
-        return False
-    
-    except FileNotFoundError as file_err:
-        TESSERACT_ERROR = str(file_err)
-        logger.warning(f"[OCR] ⚠️  {TESSERACT_ERROR}")
+        logger.warning(f"[OCR] ⚠️ {TESSERACT_ERROR}: {str(import_err)}")
         return False
     
     except Exception as e:
-        TESSERACT_ERROR = f"Unexpected error: {str(e)}"
+        TESSERACT_ERROR = f"Unexpected error initializing Tesseract: {str(e)}"
         logger.error(f"[OCR] ❌ {TESSERACT_ERROR}")
         return False
 
 # Initialize Tesseract on app startup
-setup_tesseract()
+init_tesseract()
 
 # ── PyMuPDF (fitz) for PDF processing ─────────────────────────────
 FITZ_AVAILABLE = False
@@ -2560,21 +2537,7 @@ def page_report():
     # Show warning if Tesseract is not available
     # ────────────────────────────────────────────────────────────────
     if not TESSERACT_AVAILABLE:
-        st.error(f"⚠️ OCR is Not Available")
-        st.warning(f"""
-        **Error:** {TESSERACT_ERROR}
-        
-        **For Render Deployment:**
-        Add to your `build.sh`:
-        ```bash
-        apt-get update && apt-get install -y tesseract-ocr
-        ```
-        
-        **For Local Development:**
-        1. Install Tesseract: https://github.com/UB-Mannheim/tesseract/wiki
-        2. Restart the Streamlit app
-        3. Verify installation: `tesseract --version`
-        """)
+        st.warning("OCR not available: Tesseract missing on server")
         return
     
     # ────────────────────────────────────────────────────────────────
