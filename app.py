@@ -15,13 +15,55 @@ from email.message import EmailMessage
 from contextlib import contextmanager
 import pandas as pd
 import io
+import sys
+import platform
+import shutil
 
 # ── Tesseract (optional – OCR) ────────────────────────────────────
+TESSERACT_AVAILABLE = False
+TESSERACT_ERROR = None
+
 try:
     import pytesseract
-    pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
-    TESSERACT_AVAILABLE = True
-except ImportError:
+    
+    # Platform-aware Tesseract path detection
+    system_os = platform.system()
+    
+    if system_os == "Windows":
+        # Windows: try standard installation path first, then system PATH
+        standard_path = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+        if os.path.exists(standard_path):
+            pytesseract.pytesseract.tesseract_cmd = standard_path
+        else:
+            # Try to find tesseract in system PATH
+            tesseract_path = shutil.which("tesseract")
+            if tesseract_path:
+                pytesseract.pytesseract.tesseract_cmd = tesseract_path
+            else:
+                TESSERACT_ERROR = "Tesseract OCR not found. Install from: https://github.com/UB-Mannheim/tesseract/wiki"
+    else:
+        # Linux/Mac: use system PATH (Render, Docker, etc.)
+        tesseract_path = shutil.which("tesseract")
+        if tesseract_path:
+            pytesseract.pytesseract.tesseract_cmd = tesseract_path
+        else:
+            TESSERACT_ERROR = "Tesseract OCR not installed on server. Contact administrator."
+    
+    # If we got this far without setting an error, Tesseract is available
+    if not TESSERACT_ERROR:
+        try:
+            # Test if tesseract actually works
+            pytesseract.get_tesseract_version()
+            TESSERACT_AVAILABLE = True
+        except Exception as e:
+            TESSERACT_ERROR = f"Tesseract is configured but not working: {str(e)}"
+            TESSERACT_AVAILABLE = False
+    
+except ImportError as e:
+    TESSERACT_ERROR = f"pytesseract library not installed: {str(e)}"
+    TESSERACT_AVAILABLE = False
+except Exception as e:
+    TESSERACT_ERROR = f"Unexpected error initializing Tesseract: {str(e)}"
     TESSERACT_AVAILABLE = False
 
 # ── PyMuPDF (fitz) for PDF processing ─────────────────────────────
@@ -1219,14 +1261,18 @@ def preprocess_image(img):
     return img
 
 def extract_text_ocr(uploaded):
+    """Extract text from PDF or image using OCR. Safe fallback if Tesseract unavailable."""
     if not TESSERACT_AVAILABLE:
-        return "", "Tesseract is not installed or not found at the configured path."
+        error_msg = TESSERACT_ERROR if TESSERACT_ERROR else "Tesseract OCR is not available."
+        return "", error_msg
+    
     try:
         from PIL import Image
         import io
         file_bytes = uploaded.getvalue()
         file_type  = uploaded.type.lower()
         is_pdf     = "pdf" in file_type or uploaded.name.lower().endswith(".pdf")
+        
         if is_pdf:
             if not FITZ_AVAILABLE:
                 return "", "PyMuPDF (fitz) is not installed.\nRun: pip install PyMuPDF"
@@ -1234,6 +1280,7 @@ def extract_text_ocr(uploaded):
                 pdf_document = fitz.open(stream=file_bytes, filetype="pdf")
             except Exception as e:
                 return "", f"Failed to open PDF with fitz:\n{str(e)}"
+            
             all_text = []
             try:
                 for page_num in range(len(pdf_document)):
@@ -1241,37 +1288,42 @@ def extract_text_ocr(uploaded):
                         page = pdf_document[page_num]
                         pix = page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
                         img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-                        # Convert to grayscale and apply thresholding for better OCR
                         img = img.convert("L")  # Convert to grayscale
-                        # Apply thresholding to improve OCR accuracy
                         threshold = 128
                         img = img.point(lambda p: p > threshold and 255)
                         processed = preprocess_image(img)
-                        page_text = pytesseract.image_to_string(processed, config="--oem 3 --psm 6")
-                        all_text.append(page_text)
+                        
+                        try:
+                            page_text = pytesseract.image_to_string(processed, config="--oem 3 --psm 6")
+                            all_text.append(page_text)
+                        except Exception as ocr_err:
+                            return "", f"Tesseract OCR failed on page {page_num + 1}: {str(ocr_err)}"
                     except Exception as e:
-                        all_text.append(f"[Page {page_num + 1} OCR error: {e}]")
+                        all_text.append(f"[Page {page_num + 1} processing error: {e}]")
             finally:
                 pdf_document.close()
+            
             combined = "\n".join(all_text).strip()
             if not combined:
                 return "", "OCR ran but extracted no text from the PDF."
-            # Debug output
-            st.text(combined[:500])
             return combined, None
         else:
+            # Image file
             try:
                 img = Image.open(io.BytesIO(file_bytes))
             except Exception as e:
                 return "", f"Could not open image file: {str(e)}"
+            
             try:
                 processed = preprocess_image(img)
                 text = pytesseract.image_to_string(processed, config="--oem 3 --psm 6")
             except Exception as e:
                 return "", f"Tesseract OCR failed on image: {str(e)}"
+            
             if not text.strip():
                 return "", "OCR extracted no text from the image."
             return text.strip(), None
+    
     except Exception as e:
         return "", f"Unexpected OCR error: {str(e)}"
 
@@ -2430,6 +2482,20 @@ def page_upload():
 # ╚══════════════════════════════════════════════════════════════════╝
 def page_report():
     page_header("🤖", "AI Upload Report", "OCR + AI extracts every parameter into a structured table")
+    
+    # Show warning if Tesseract is not available
+    if not TESSERACT_AVAILABLE:
+        st.error(f"⚠️ OCR is not available: {TESSERACT_ERROR}")
+        st.info("""
+        **Why is OCR unavailable?**
+        - Tesseract OCR library is not installed on the server
+        - Contact the administrator to install Tesseract
+        
+        **Local Development Fix:**
+        - Install Tesseract: https://github.com/UB-Mannheim/tesseract/wiki
+        - Restart the Streamlit app
+        """)
+        return
 
     card_open("How AI Report Analysis Works")
     st.markdown("""<div style="font-size:.9rem;color:#2d3f6b !important;line-height:1.9">
@@ -2439,7 +2505,7 @@ def page_report():
       <b style="color:#d9880c !important;">Step 4:</b> Review results and save directly to your health profile.
       <br><br>
       <span style="color:#5a6f99 !important;font-size:.82rem">
-        ℹ️ Tesseract path: <code>C:\\Program Files\\Tesseract-OCR\\tesseract.exe</code> &nbsp;|&nbsp;
+        ℹ️ Tesseract library: Installed & operational &nbsp;|&nbsp;
         PyMuPDF library: <code>fitz</code>
       </span>
     </div>""", unsafe_allow_html=True)
