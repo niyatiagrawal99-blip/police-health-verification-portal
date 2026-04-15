@@ -18,60 +18,99 @@ import io
 import sys
 import platform
 import shutil
+import logging
+
+# ── Configure logging ──────────────────────────────────────────────
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # ── Tesseract (optional – OCR) ────────────────────────────────────
 TESSERACT_AVAILABLE = False
 TESSERACT_ERROR = None
+pytesseract = None
 
-try:
-    import pytesseract
+def setup_tesseract():
+    """
+    Initialize Tesseract OCR for both Windows (local dev) and Linux (Render cloud).
+    Safely handles missing Tesseract without crashing the app.
+    """
+    global TESSERACT_AVAILABLE, TESSERACT_ERROR, pytesseract
     
-    # Platform-aware Tesseract path detection
-    system_os = platform.system()
-    
-    if system_os == "Windows":
-        # Windows: try standard installation path first, then system PATH
-        standard_path = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
-        if os.path.exists(standard_path):
-            pytesseract.pytesseract.tesseract_cmd = standard_path
+    try:
+        import pytesseract as pyt
+        pytesseract = pyt
+        logger.info("[OCR] pytesseract library imported successfully")
+        
+        system_os = platform.system()
+        logger.info(f"[OCR] Detected OS: {system_os}")
+        
+        # ── Windows: Try standard path, fallback to system PATH ──
+        if system_os == "Windows":
+            standard_path = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+            
+            if os.path.exists(standard_path):
+                pytesseract.pytesseract.tesseract_cmd = standard_path
+                logger.info(f"[OCR] Using standard Windows path: {standard_path}")
+            else:
+                # Fallback to system PATH
+                tesseract_path = shutil.which("tesseract")
+                if tesseract_path:
+                    pytesseract.pytesseract.tesseract_cmd = tesseract_path
+                    logger.info(f"[OCR] Using system PATH tesseract: {tesseract_path}")
+                else:
+                    raise FileNotFoundError("Tesseract not found in standard path or system PATH")
+        
+        # ── Linux/Mac: Use system PATH (Render, Docker, etc.) ──
         else:
-            # Try to find tesseract in system PATH
             tesseract_path = shutil.which("tesseract")
             if tesseract_path:
                 pytesseract.pytesseract.tesseract_cmd = tesseract_path
+                logger.info(f"[OCR] Using system tesseract: {tesseract_path}")
             else:
-                TESSERACT_ERROR = "Tesseract OCR not found. Install from: https://github.com/UB-Mannheim/tesseract/wiki"
-    else:
-        # Linux/Mac: use system PATH (Render, Docker, etc.)
-        tesseract_path = shutil.which("tesseract")
-        if tesseract_path:
-            pytesseract.pytesseract.tesseract_cmd = tesseract_path
-        else:
-            TESSERACT_ERROR = "Tesseract OCR not installed on server. Contact administrator."
-    
-    # If we got this far without setting an error, Tesseract is available
-    if not TESSERACT_ERROR:
+                raise FileNotFoundError("Tesseract not found in system PATH")
+        
+        # ── Test if Tesseract actually works ──
         try:
-            # Test if tesseract actually works
-            pytesseract.get_tesseract_version()
+            version = pytesseract.get_tesseract_version()
+            logger.info(f"[OCR] Tesseract version: {version}")
             TESSERACT_AVAILABLE = True
-        except Exception as e:
-            TESSERACT_ERROR = f"Tesseract is configured but not working: {str(e)}"
-            TESSERACT_AVAILABLE = False
+            logger.info("[OCR] ✅ Tesseract initialized successfully")
+            return True
+        
+        except Exception as test_err:
+            TESSERACT_ERROR = f"Tesseract found but not working: {str(test_err)}"
+            logger.error(f"[OCR] ❌ {TESSERACT_ERROR}")
+            return False
     
-except ImportError as e:
-    TESSERACT_ERROR = f"pytesseract library not installed: {str(e)}"
-    TESSERACT_AVAILABLE = False
-except Exception as e:
-    TESSERACT_ERROR = f"Unexpected error initializing Tesseract: {str(e)}"
-    TESSERACT_AVAILABLE = False
+    except ImportError as import_err:
+        TESSERACT_ERROR = "pytesseract library not installed"
+        logger.warning(f"[OCR] ⚠️  {TESSERACT_ERROR}: {str(import_err)}")
+        return False
+    
+    except FileNotFoundError as file_err:
+        TESSERACT_ERROR = str(file_err)
+        logger.warning(f"[OCR] ⚠️  {TESSERACT_ERROR}")
+        return False
+    
+    except Exception as e:
+        TESSERACT_ERROR = f"Unexpected error: {str(e)}"
+        logger.error(f"[OCR] ❌ {TESSERACT_ERROR}")
+        return False
+
+# Initialize Tesseract on app startup
+setup_tesseract()
 
 # ── PyMuPDF (fitz) for PDF processing ─────────────────────────────
+FITZ_AVAILABLE = False
+fitz = None
+
 try:
-    import fitz
+    import fitz as fitz_lib
+    fitz = fitz_lib
     FITZ_AVAILABLE = True
+    logger.info("[PDF] PyMuPDF (fitz) imported successfully")
 except ImportError:
-    FITZ_AVAILABLE = False
+    logger.warning("[PDF] PyMuPDF (fitz) not installed")
 
 # ── Password hashing ──────────────────────────────────────────────
 def hash_pw(password):
@@ -1261,34 +1300,44 @@ def preprocess_image(img):
     return img
 
 def extract_text_ocr(uploaded):
-    """Extract text from PDF or image using OCR. Safe fallback if Tesseract unavailable."""
+    """
+    Extract text from PDF or image using OCR.
+    Safe: Returns empty text with error message if OCR unavailable.
+    """
     if not TESSERACT_AVAILABLE:
-        error_msg = TESSERACT_ERROR if TESSERACT_ERROR else "Tesseract OCR is not available."
+        error_msg = TESSERACT_ERROR or "Tesseract OCR is not available."
+        logger.warning(f"[OCR] OCR unavailable: {error_msg}")
         return "", error_msg
     
     try:
         from PIL import Image
-        import io
         file_bytes = uploaded.getvalue()
-        file_type  = uploaded.type.lower()
-        is_pdf     = "pdf" in file_type or uploaded.name.lower().endswith(".pdf")
+        file_type = uploaded.type.lower()
+        is_pdf = "pdf" in file_type or uploaded.name.lower().endswith(".pdf")
         
+        # ── PDF Processing ──
         if is_pdf:
             if not FITZ_AVAILABLE:
-                return "", "PyMuPDF (fitz) is not installed.\nRun: pip install PyMuPDF"
+                logger.error("[OCR] PyMuPDF (fitz) not available for PDF processing")
+                return "", "PyMuPDF (fitz) is not installed. Cannot process PDF."
+            
             try:
                 pdf_document = fitz.open(stream=file_bytes, filetype="pdf")
             except Exception as e:
-                return "", f"Failed to open PDF with fitz:\n{str(e)}"
+                logger.error(f"[OCR] Failed to open PDF: {str(e)}")
+                return "", f"Failed to open PDF: {str(e)}"
             
             all_text = []
+            page_count = len(pdf_document)
+            logger.info(f"[OCR] Processing PDF with {page_count} pages")
+            
             try:
-                for page_num in range(len(pdf_document)):
+                for page_num in range(page_count):
                     try:
                         page = pdf_document[page_num]
                         pix = page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
                         img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-                        img = img.convert("L")  # Convert to grayscale
+                        img = img.convert("L")
                         threshold = 128
                         img = img.point(lambda p: p > threshold and 255)
                         processed = preprocess_image(img)
@@ -1296,38 +1345,59 @@ def extract_text_ocr(uploaded):
                         try:
                             page_text = pytesseract.image_to_string(processed, config="--oem 3 --psm 6")
                             all_text.append(page_text)
+                            logger.info(f"[OCR] Successfully extracted page {page_num + 1}")
                         except Exception as ocr_err:
-                            return "", f"Tesseract OCR failed on page {page_num + 1}: {str(ocr_err)}"
-                    except Exception as e:
-                        all_text.append(f"[Page {page_num + 1} processing error: {e}]")
+                            logger.error(f"[OCR] Tesseract failed on page {page_num + 1}: {str(ocr_err)}")
+                            # Add error marker but continue processing
+                            all_text.append(f"[Page {page_num + 1} OCR failed]")
+                    
+                    except Exception as page_err:
+                        logger.warning(f"[OCR] Error processing page {page_num + 1}: {str(page_err)}")
+                        all_text.append(f"[Page {page_num + 1} error]")
+            
             finally:
                 pdf_document.close()
             
             combined = "\n".join(all_text).strip()
-            if not combined:
-                return "", "OCR ran but extracted no text from the PDF."
+            if not combined or all("[" in line for line in combined.split("\n")):
+                logger.warning("[OCR] No text extracted from PDF")
+                return "", "No readable text extracted from PDF. Try a clearer image."
+            
+            logger.info(f"[OCR] PDF extraction successful: {len(combined)} chars")
             return combined, None
+        
+        # ── Image Processing ──
         else:
-            # Image file
             try:
                 img = Image.open(io.BytesIO(file_bytes))
+                logger.info(f"[OCR] Opened image: {img.size}")
             except Exception as e:
-                return "", f"Could not open image file: {str(e)}"
+                logger.error(f"[OCR] Failed to open image: {str(e)}")
+                return "", f"Could not open image: {str(e)}"
             
             try:
                 processed = preprocess_image(img)
                 text = pytesseract.image_to_string(processed, config="--oem 3 --psm 6")
+                logger.info(f"[OCR] Image OCR complete: {len(text)} chars")
             except Exception as e:
-                return "", f"Tesseract OCR failed on image: {str(e)}"
+                logger.error(f"[OCR] Tesseract failed on image: {str(e)}")
+                return "", f"OCR processing failed: {str(e)}"
             
             if not text.strip():
-                return "", "OCR extracted no text from the image."
+                logger.warning("[OCR] Image OCR returned no text")
+                return "", "No text could be extracted from the image."
+            
             return text.strip(), None
     
     except Exception as e:
-        return "", f"Unexpected OCR error: {str(e)}"
+        logger.error(f"[OCR] Unexpected error in extract_text_ocr: {str(e)}")
+        return "", f"Unexpected error during OCR: {str(e)}"
 
 def clean_ocr_text(raw: str) -> str:
+    """Clean OCR text by removing noise and normalizing formatting."""
+    if not raw:
+        return ""
+    
     raw = raw.replace('\r', '\n')
     lines = []
     for line in raw.splitlines():
@@ -1337,7 +1407,10 @@ def clean_ocr_text(raw: str) -> str:
         if re.match(r'^[\W_]+$', line):
             continue
         lines.append(line.lower())
-    return "\n".join(lines)
+    
+    result = "\n".join(lines)
+    logger.debug(f"[OCR] Cleaned text: {len(result)} chars from {len(raw)}")
+    return result
 
 
 def extract_patient_details(text: str) -> dict:
@@ -2483,30 +2556,40 @@ def page_upload():
 def page_report():
     page_header("🤖", "AI Upload Report", "OCR + AI extracts every parameter into a structured table")
     
+    # ────────────────────────────────────────────────────────────────
     # Show warning if Tesseract is not available
+    # ────────────────────────────────────────────────────────────────
     if not TESSERACT_AVAILABLE:
-        st.error(f"⚠️ OCR is not available: {TESSERACT_ERROR}")
-        st.info("""
-        **Why is OCR unavailable?**
-        - Tesseract OCR library is not installed on the server
-        - Contact the administrator to install Tesseract
+        st.error(f"⚠️ OCR is Not Available")
+        st.warning(f"""
+        **Error:** {TESSERACT_ERROR}
         
-        **Local Development Fix:**
-        - Install Tesseract: https://github.com/UB-Mannheim/tesseract/wiki
-        - Restart the Streamlit app
+        **For Render Deployment:**
+        Add to your `build.sh`:
+        ```bash
+        apt-get update && apt-get install -y tesseract-ocr
+        ```
+        
+        **For Local Development:**
+        1. Install Tesseract: https://github.com/UB-Mannheim/tesseract/wiki
+        2. Restart the Streamlit app
+        3. Verify installation: `tesseract --version`
         """)
         return
-
+    
+    # ────────────────────────────────────────────────────────────────
+    # OCR is available - show normal interface
+    # ────────────────────────────────────────────────────────────────
     card_open("How AI Report Analysis Works")
     st.markdown("""<div style="font-size:.9rem;color:#2d3f6b !important;line-height:1.9">
       <b style="color:#d9880c !important;">Step 1:</b> Upload your lab report (PDF, JPG or PNG) — up to 50 MB.<br>
-      <b style="color:#d9880c !important;">Step 2:</b> PDF is converted to images via PyMuPDF (fitz), then OCR reads all text.<br>
-      <b style="color:#d9880c !important;">Step 3:</b> AI extracts <em>every</em> detectable field into a clean grouped table.<br>
+      <b style="color:#d9880c !important;">Step 2:</b> PDF is converted to images, then OCR extracts text.<br>
+      <b style="color:#d9880c !important;">Step 3:</b> AI detects and normalizes every health parameter.<br>
       <b style="color:#d9880c !important;">Step 4:</b> Review results and save directly to your health profile.
       <br><br>
       <span style="color:#5a6f99 !important;font-size:.82rem">
-        ℹ️ Tesseract library: Installed & operational &nbsp;|&nbsp;
-        PyMuPDF library: <code>fitz</code>
+        ✅ Tesseract OCR: Active &nbsp;|&nbsp; 
+        PyMuPDF (PDF support): """ + ("✅ Active" if FITZ_AVAILABLE else "❌ Inactive") + """
       </span>
     </div>""", unsafe_allow_html=True)
     card_close()
@@ -2523,12 +2606,12 @@ def page_report():
 
     size_mb = len(up.getvalue()) / (1024 * 1024)
     if size_mb > 50:
-        st.markdown(f"""<div class="alert-box alert-danger">🚫 File too large: {size_mb:.1f} MB. Max 50 MB.</div>""", unsafe_allow_html=True)
+        st.error(f"❌ File too large: {size_mb:.1f} MB (max 50 MB)")
         return
 
     is_pdf = "pdf" in up.type.lower() or up.name.lower().endswith(".pdf")
     file_type_label = "PDF" if is_pdf else "Image"
-    st.markdown(f"""<div class="alert-box alert-ok">✅ File ready: <b>{up.name}</b> ({size_mb:.2f} MB) · {file_type_label}</div>""", unsafe_allow_html=True)
+    st.success(f"✅ Ready: {up.name} ({size_mb:.2f} MB) · {file_type_label}")
 
     if not st.button("🤖  EXTRACT & ANALYSE →", use_container_width=True):
         return
@@ -2538,76 +2621,105 @@ def page_report():
         raw_text, ocr_error = extract_text_ocr(up)
 
     if ocr_error:
-        st.markdown(f"""<div class="ocr-error">
-          ❌ <b>OCR Failed</b> — here is the actual error:<br>
-          <pre>{ocr_error}</pre>
-        </div>""", unsafe_allow_html=True)
-        st.info("Fix the error above and re-upload.")
+        st.error(f"❌ OCR Processing Failed")
+        st.error(f"**Error:** {ocr_error}")
+        st.info("""
+        **Troubleshooting:**
+        - Ensure the image is clear and at least 300 DPI
+        - Try a different file format (JPG, PNG, or PDF)
+        - The file may be corrupted or unreadable
+        """)
+        logger.error(f"[PAGE] OCR extraction failed: {ocr_error}")
         return
 
     if not raw_text or len(raw_text.strip()) < 20:
-        st.markdown("""<div class="alert-box alert-warn">
-          ⚠️ OCR succeeded but extracted very little text.
-          Ensure the file is a clear scan at 300+ DPI.
-        </div>""", unsafe_allow_html=True)
+        st.warning("⚠️ OCR succeeded but extracted very little text")
+        st.info("Ensure the file is a clear scan or image at 300+ DPI")
+        st.text_area("Extracted Text Preview:", value=raw_text[:1000] if raw_text else "(empty))", height=150)
+        logger.warning("[PAGE] OCR returned minimal text")
         return
 
-    cleaned = clean_ocr_text(raw_text)
-
-    st.text("OCR TEXT:")
-    st.text(raw_text[:1500])
-
-    patient_details = extract_patient_details(cleaned)
-    with st.spinner("🧠 AI extracting all parameters..."):
-        extracted = extract_all_fields(cleaned)
+    # ── Safe extraction pipeline ──
+    try:
+        cleaned = clean_ocr_text(raw_text)
+        logger.info(f"[PAGE] OCR text cleaned: {len(cleaned)} chars")
+        
+        st.text("OCR TEXT PREVIEW:")
+        st.text(raw_text[:1500])
+        
+        patient_details = extract_patient_details(cleaned)
+        logger.info(f"[PAGE] Patient details extracted: {patient_details}")
+        
+        with st.spinner("🧠 AI extracting all parameters..."):
+            extracted = extract_all_fields(cleaned)
+        
+        logger.info(f"[PAGE] Parameters extracted: {len(extracted)} fields")
+    
+    except Exception as e:
+        st.error(f"❌ Error during extraction pipeline: {str(e)}")
+        logger.error(f"[PAGE] Extraction pipeline error: {str(e)}")
+        st.text_area("Raw OCR Output:", value=raw_text[:2000], height=200)
+        return
 
     total_found = len(extracted)
     if total_found == 0:
-        st.markdown("""<div class="alert-box alert-warn">⚠️ No parameters detected.</div>""", unsafe_allow_html=True)
-        st.text_area("OCR Output:", value=cleaned[:2000], height=200)
+        st.warning("⚠️ No medical parameters could be detected")
+        st.info("""
+        The OCR text may not contain health-related values. Try:
+        - Upload a different medical report
+        - Ensure the document has clear medical parameters
+        """)
+        st.text_area("Raw OCR Output:", value=cleaned[:2000], height=200)
+        logger.warning("[PAGE] No parameters extracted from document")
         return
 
-    st.success(f"✅ {total_found} parameter(s) successfully extracted.")
+    st.success(f"✅ Successfully extracted {total_found} parameter(s)")
 
-    # Auto-save immediately after extraction
-    db_rec = {"source": "AI Report Upload", "record_date": str(datetime.date.today())}
-    for field, val in extracted.items():
-        db_col = FIELD_TO_DB.get(field.lower())
-        if db_col:
+    # ── Auto-save with error handling ──
+    try:
+        db_rec = {"source": "AI Report Upload", "record_date": str(datetime.date.today())}
+        for field, val in extracted.items():
+            db_col = FIELD_TO_DB.get(field.lower())
+            if db_col:
+                try:
+                    db_rec[db_col] = float(val)
+                except (ValueError, TypeError):
+                    db_rec[db_col] = str(val)
+
+        if "weight" in db_rec and "height" in db_rec and not db_rec.get("bmi"):
             try:
-                db_rec[db_col] = float(val)
-            except (ValueError, TypeError):
-                db_rec[db_col] = str(val)
+                h = float(db_rec["height"])
+                w = float(db_rec["weight"])
+                if h > 0:
+                    db_rec["bmi"] = round(w / ((h / 100) ** 2), 1)
+            except:
+                pass
 
-    if "weight" in db_rec and "height" in db_rec and not db_rec.get("bmi"):
-        try:
-            h = float(db_rec["height"])
-            w = float(db_rec["weight"])
-            if h > 0:
-                db_rec["bmi"] = round(w / ((h / 100) ** 2), 1)
-        except:
-            pass
-
-    db_rec["notes"] = f"AI-extracted from {up.name}. Patient: {patient_details.get('patient_name','Unknown')}"
-    saved_id = save_health_record(st.session_state.username, db_rec)
-    if saved_id:
-        st.session_state.force_select_id = saved_id
-        update_user_field(st.session_state.username, last_checkup=db_rec["record_date"])
-        st.session_state.record_just_saved = True
-        st.session_state.save_ts = time.time()
-        st.session_state.current_report_data = db_rec.copy()
-        st.session_state.current_report_data["id"] = saved_id
-        st.markdown(f"""<div class="save-success">
-          <div class="save-success-icon">✅</div>
-          <div class="save-success-text">
-            Record saved! <b>{total_found} parameters</b> extracted, <b>{len([k for k in db_rec if k not in ("source","record_date")])} values</b> stored.<br>
-            <span style="font-size:.85rem;font-weight:400;color:#0a6b3e !important;">
-              Live in: <b>Health History · Health Charts · Fitness Score · Prediction · Welcome</b>
-            </span>
-          </div>
-        </div>""", unsafe_allow_html=True)
-    else:
-        st.error("Failed to save the record. Please try again.")
+        db_rec["notes"] = f"AI-extracted from {up.name}. Patient: {patient_details.get('patient_name','Unknown')}"
+        saved_id = save_health_record(st.session_state.username, db_rec)
+        
+        if saved_id:
+            st.session_state.force_select_id = saved_id
+            update_user_field(st.session_state.username, last_checkup=db_rec["record_date"])
+            st.session_state.record_just_saved = True
+            st.session_state.save_ts = time.time()
+            st.session_state.current_report_data = db_rec.copy()
+            st.session_state.current_report_data["id"] = saved_id
+            st.success("""✅ Record saved successfully!""")
+            st.info(f"""
+            **Extraction Summary:**
+            - **Parameters extracted:** {total_found}
+            - **Values stored:** {len([k for k in db_rec if k not in ("source","record_date")])}
+            - **Location:** Health History · Health Charts · Fitness Score
+            """)
+            logger.info(f"[PAGE] Record saved successfully: ID={saved_id}, {total_found} params")
+        else:
+            st.error("❌ Failed to save the record to database")
+            logger.error("[PAGE] Failed to save health record")
+    
+    except Exception as save_err:
+        st.error(f"❌ Error saving record: {str(save_err)}")
+        logger.error(f"[PAGE] Record save error: {str(save_err)}")
 
     tab_full, tab_grouped, tab_vitals, tab_ocr = st.tabs([
         "📊 Full Extraction Table",
